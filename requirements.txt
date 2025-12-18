@@ -1,0 +1,8 @@
+regex==2024.11.6
+tqdm==4.67.1
+numpy==2.2.4
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+datasets==3.5.0
+huggingface-hub==0.30.1
