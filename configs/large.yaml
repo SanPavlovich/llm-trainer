@@ -1,0 +1,63 @@
+# Training run configuration for a ~1B parameter model.
+# Loaded and validated by src.schemas.RunConfig (see train.py).
+#
+# Param count (verified): 1.0175B
+#   hidden_dim=2048, n_layer=20, n_head=16, n_kv_head=4 (GQA), intermediate_dim=5504,
+#   vocab_size=32000, separate (untied) lm_head.
+# Constraints satisfied: hidden_dim % n_head == 0 (head_dim=128),
+#   n_head % n_kv_head == 0, intermediate_dim % 128 == 0.
+
+run_name: llm_large_train        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
+exp_name: pretrain_1b
+seed: 42
+deterministic: false       # deterministic algs are slow; disable for a real 1B run
+shuffle_train: true        # shuffle for real training (set false only to A/B convergence)
+
+dataset_path: "hf://datasets/IgorVolochay/russian_jokes/dataset.json"
+test_size: 0.1
+valid_texts:
+  - "Заходит в бар"
+  - "Штирлиц пришел домой"
+
+tokenizer:
+  vocab_size: 32000         # real Russian pretraining needs a larger vocab than 1024
+  special_tokens: ["[EOS]"]
+
+# ~1B model architecture.
+model:
+  n_layer: 20
+  n_head: 16
+  n_kv_head: 4              # grouped-query attention (4 kv heads shared by 16 q heads)
+  hidden_dim: 2048
+  intermediate_dim: 5504
+  dropout: 0.0             # dropout usually 0 for large-model pretraining
+  vocab_size: 32000
+  max_seq_len: 2048
+  use_rope: true
+  rope_theta: 10000.0
+  use_mla: false
+  latent_dim: 512
+
+trainer:
+  max_seq_len: 2048
+  batch_size: 8            # tune to fit VRAM; use grad accumulation for a larger effective batch
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  clip_grad_norm: 1.0
+  n_steps: 100000
+  val_every_n_steps: 2000
+  val_after_train: true
+
+# PyTorch profiler. Disabled by default for a long run; enable to capture a single step.
+profiler:
+  enabled: false
+  wait: 8
+  warmup: 1
+  active: 1
+  repeat: 1
+  record_shapes: true
+  profile_memory: true
+  with_stack: false
+  memory_snapshot: false
+  memory_snapshot_step: 9
+  memory_snapshot_max_entries: 100000

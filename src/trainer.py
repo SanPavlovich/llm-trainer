@@ -1,12 +1,23 @@
 from pathlib import Path
+import contextlib
+import functools
 from tqdm.auto import tqdm
 import torch
+from torch import Tensor
+from torch.profiler import profile as Profiler
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from src.schemas import TrainerConfig
+from src.schemas import TrainerConfig, ProfilerConfig
 from src.tokenizer import ByteLevelBPETokenizer
 from src.model import TransformerForCausalLM
 from src.utils import cross_entropy_loss, get_linear_schedule_with_warmup
+
+
+def trace_handler(prof: Profiler, traces_dir: Path) -> None:
+    prof.export_chrome_trace(
+        str(traces_dir / f"trace.json")
+    )
 
 
 class Trainer:
@@ -16,12 +27,17 @@ class Trainer:
         tokenizer: ByteLevelBPETokenizer,
         model: TransformerForCausalLM,
         valid_texts: list[str],
-        log_dir: Path,
+        tensorboard_dir: Path,
+        checkpoint_dir: Path,
+        profiler_dir: Path | None = None,
+        profiler_config: ProfilerConfig | None = None,
         optimizer: torch.optim.Optimizer|None=None,
         scheduler: torch.optim.lr_scheduler.LRScheduler|None=None,
     ) -> None:
         self.train_config = train_config
-        self.log_dir = log_dir
+        self.checkpoint_dir = checkpoint_dir
+        self.profiler_dir = profiler_dir
+        self.profiler_config = profiler_config
         self.valid_texts = valid_texts
         self.tokenizer = tokenizer
         self.model = model
@@ -42,8 +58,8 @@ class Trainer:
         else:
             self.scheduler = scheduler
         self.global_step = 0
-        self.writer = SummaryWriter(log_dir / "train")
-        self.valid_writer = SummaryWriter(log_dir / "valid")
+        self.writer = SummaryWriter(tensorboard_dir / "train")
+        self.valid_writer = SummaryWriter(tensorboard_dir / "valid")
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -53,8 +69,66 @@ class Trainer:
             self.device = "cpu"
         print("running on device", self.device)
 
+    def _build_profiler(self) -> Profiler | None:
+        """Create a torch.profiler that traces the configured iteration(s).
+
+        Traces are written to profiler_dir in TensorBoard format (viewable via
+        the PyTorch Profiler TensorBoard plugin) and as Chrome trace JSON.
+        Returns None when profiling is disabled.
+        """
+        cfg = self.profiler_config
+        if cfg is None or not cfg.enabled or self.profiler_dir is None:
+            return None
+
+        self.profiler_dir.mkdir(parents=True, exist_ok=True)
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if self.device == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        return Profiler(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=cfg.wait, warmup=cfg.warmup, active=cfg.active, repeat=cfg.repeat
+            ),
+            on_trace_ready=functools.partial(trace_handler, traces_dir=self.profiler_dir),
+            record_shapes=cfg.record_shapes,
+            profile_memory=cfg.profile_memory,
+            with_stack=cfg.with_stack,
+        )
+
+    def _memory_snapshot_enabled(self) -> bool:
+        cfg = self.profiler_config
+        return (
+            cfg is not None
+            and cfg.memory_snapshot
+            and self.device == "cuda"
+            and self.profiler_dir is not None
+        )
+
+    def _maybe_start_memory_snapshot(self, iter_num: int) -> None:
+        """Start recording CUDA allocation history one iteration before the target,
+        so the snapshot captures exactly the target iteration's allocations."""
+        if not self._memory_snapshot_enabled():
+            return
+        if iter_num == self.profiler_config.memory_snapshot_step - 1:
+            torch.cuda.memory._record_memory_history(
+                max_entries=self.profiler_config.memory_snapshot_max_entries
+            )
+
+    def _maybe_dump_memory_snapshot(self, iter_num: int) -> None:
+        """Dump and stop recording right after the target iteration."""
+        if not self._memory_snapshot_enabled():
+            return
+        if iter_num == self.profiler_config.memory_snapshot_step:
+            self.profiler_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_path = self.profiler_dir / f"memory_snapshot_step{iter_num}.pickle"
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+            torch.cuda.memory._record_memory_history(enabled=None)  # stop & free buffer
+            print(f"CUDA memory snapshot saved to {snapshot_path}")
+
     @torch.no_grad()
-    def validate(self, val_loader):
+    def validate(self, val_loader: DataLoader) -> Tensor:
         self.model.eval()
         val_loss = 0.0
         for batch in tqdm(val_loader, desc="Validating", leave=False):
@@ -66,8 +140,8 @@ class Trainer:
             val_loss += cross_entropy_loss(input_ids, attention_mask, logits)
         return val_loss / len(val_loader)
     
-    def save_checkpoint(self):
-        checkpoint_name = f"{self.log_dir}/{self.global_step}.pkl"
+    def save_checkpoint(self) -> None:
+        checkpoint_name = f"{self.checkpoint_dir}/{self.global_step}.pkl"
         torch.save({
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
@@ -106,49 +180,69 @@ class Trainer:
         self.model.to(self.device)
         self.model.train()
 
+        profiler = self._build_profiler()
         data_iter = iter(train_loader)
-        for iter_num in tqdm(range(self.train_config.n_steps), desc="train steps"):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
+        self.train_loss, self.valid_loss = None, None
 
-            input_ids, attention_mask = batch
-            input_ids = input_ids.to(self.device, non_blocking=True)
-            attention_mask = attention_mask.to(self.device, non_blocking=True)
+        with profiler if profiler is not None else contextlib.nullcontext():
+            for iter_num in tqdm(range(self.train_config.n_steps), desc="train steps"):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    batch = next(data_iter)
 
-            logits = self.model(input_ids, attention_mask)  # [bs; seq len; vocab size]
-            loss = cross_entropy_loss(input_ids, attention_mask, logits)
+                self._maybe_start_memory_snapshot(iter_num)
 
-            # backprop and update the parameters
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.clip_grad_norm)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
+                with torch.profiler.record_function("train_step"):
+                    input_ids, attention_mask = batch
+                    input_ids = input_ids.to(self.device, non_blocking=True)
+                    attention_mask = attention_mask.to(self.device, non_blocking=True)
 
-            self.train_loss = loss.item()
-            self.writer.add_scalar("loss", self.train_loss, self.global_step)
-            self.writer.add_scalar("grad_norm", grad_norm, self.global_step)
-            self.writer.add_scalar("learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
+                    with torch.profiler.record_function("model_forward"):
+                        logits = self.model(input_ids, attention_mask)  # [bs; seq len; vocab size]
+                    with torch.profiler.record_function("cross_entropy_loss"):
+                        loss = cross_entropy_loss(input_ids, attention_mask, logits)
+                    with torch.profiler.record_function("loss_backward"):
+                        loss.backward()
+                    with torch.profiler.record_function("clip_grad_norm"):
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.clip_grad_norm)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
 
-            if iter_num > 0 and iter_num % self.train_config.val_every_n_steps == 0:
-                val_loss = self.validate(val_loader)
-                self.valid_loss = val_loss
-                self.valid_writer.add_scalar("loss", val_loss, self.global_step)
-                self.log_model_samples(text_field=f"model samples step {self.global_step}")
-                self.model.train()
+                self.train_loss = loss.item()
+                self.writer.add_scalar("loss", self.train_loss, self.global_step)
+                self.writer.add_scalar("grad_norm", grad_norm, self.global_step)
+                self.writer.add_scalar("learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
 
-                if save_checkpoint:
-                    self.save_checkpoint()
-            
-            self.global_step += 1
+                if (
+                    iter_num > 0
+                    and self.train_config.val_every_n_steps != 0
+                    and iter_num % self.train_config.val_every_n_steps == 0
+                ):
+                    val_loss = self.validate(val_loader)
+                    self.valid_loss = val_loss.item()
+                    self.valid_writer.add_scalar("loss", val_loss, self.global_step)
+                    self.log_model_samples(text_field=f"model samples step {self.global_step}")
+                    self.model.train()
 
-        val_loss = self.validate(val_loader)
-        self.valid_loss = val_loss
-        self.valid_writer.add_scalar("loss", val_loss, self.global_step)
-        self.log_model_samples(text_field="model samples train end")
+                    if save_checkpoint:
+                        self.save_checkpoint()
+
+                self._maybe_dump_memory_snapshot(iter_num)
+
+                # advance the profiler schedule (no-op when profiling disabled)
+                if profiler is not None:
+                    profiler.step()
+
+                self.global_step += 1
+
+        if self.train_config.val_after_train:
+            val_loss = self.validate(val_loader)
+            self.valid_loss = val_loss
+            self.valid_writer.add_scalar("loss", val_loss, self.global_step)
+            self.log_model_samples(text_field="model samples train end")
         
         if save_checkpoint:
             self.save_checkpoint()

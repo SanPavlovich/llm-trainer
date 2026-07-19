@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from functools import partial
 
 
@@ -34,8 +34,15 @@ def data_collator(
     return input_ids, attention_mask
 
 
-def create_dataloader(dataset, pad_token_id, max_seq_len, batch_size, is_train):
+def create_dataloader(
+    dataset: Dataset,
+    pad_token_id: int,
+    max_seq_len: int,
+    batch_size: int,
+    drop_last: bool,
+    shuffle: bool | None = None,
+) -> DataLoader:
     collate_fn = partial(data_collator, pad_token_id=pad_token_id, max_seq_len=max_seq_len)
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=is_train, drop_last=is_train, collate_fn=collate_fn, pin_memory=True
+        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, collate_fn=collate_fn, pin_memory=True
     )

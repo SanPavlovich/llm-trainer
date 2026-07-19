@@ -1,6 +1,33 @@
+import os
+import random
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    """Fix random seeds across python, numpy and torch for reproducibility.
+
+    Args:
+        seed: seed value to set everywhere
+        deterministic: if True, force deterministic (and slower) CUDA/cuDNN
+            algorithms so runs are bit-for-bit reproducible. Useful for
+            strictly tracking loss convergence when adding a new feature.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # cuBLAS reproducibility for matmul on CUDA >= 10.2
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps) -> torch.optim.lr_scheduler.LRScheduler:
