@@ -1,19 +1,23 @@
 # Training run configuration.
 # Loaded and validated by src.schemas.RunConfig (see main.py).
 
-run_name: llm_small_train        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
+run_name: llm_small_sft        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
 exp_name: train_10000         # name of this specific experiment within the run
 seed: 42
 deterministic: true        # force deterministic CUDA/cuDNN algorithms for reproducible runs
 shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
 
+dataset_type: text # ['text', 'token_ids']
 dataset_path: "hf://datasets/IgorVolochay/russian_jokes/dataset.json"
-test_size: 0.1
+tokenized_dataset_path: "datasets/NotEvilAI_ruwiki_169K_tokenized_msl128.npy"
+test_size: 0.05
+
 valid_texts:
   - "Заходит в бар"
   - "Штирлиц пришел домой"
 
 tokenizer:
+  cache_dir: "russian_jokes"
   vocab_size: 1024
   special_tokens: ["[EOS]"]
 

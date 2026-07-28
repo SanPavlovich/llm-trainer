@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 
 class TokenizerConfig(BaseModel):
+    cache_dir: str | None = None
     vocab_size: int = 1024
     special_tokens: list[str] = ["[EOS]"]
 
@@ -68,7 +69,14 @@ class RunConfig(BaseModel):
     deterministic: bool = True
     shuffle_train: bool = False
 
+    # "text": tokenize raw documents on the fly (TextDataset + collator).
+    # "token_ids": load a pre-tokenized .npy of fixed-length blocks
+    #              (TokenIdsDataset, no collator). See tokenized_data_path.
+    dataset_type: str = "text"
     dataset_path: str = "hf://datasets/IgorVolochay/russian_jokes/dataset.json"
+    # Path to the pre-tokenized (n_blocks, block_len) .npy; used when
+    # dataset_type == "token_ids".
+    tokenized_dataset_path: str | None = None
     test_size: float = 0.1
     valid_texts: list[str] = []
 

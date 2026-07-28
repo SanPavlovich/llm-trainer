@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.schemas import TrainerConfig, ProfilerConfig
-from src.tokenizer import ByteLevelBPETokenizer
+from src.tokenizer.bpe_tokenizer import ByteLevelBPETokenizer
 from src.model import TransformerForCausalLM
 from src.utils import cross_entropy_loss, get_linear_schedule_with_warmup
 
@@ -176,7 +176,12 @@ class Trainer:
             )
 
 
-    def train(self, train_loader, val_loader, save_checkpoint=True):
+    def train(
+        self, 
+        train_loader: DataLoader, 
+        val_loader: DataLoader | None, 
+        save_checkpoint=True
+    ) -> None:
         self.model.to(self.device)
         self.model.train()
 
@@ -217,7 +222,8 @@ class Trainer:
                 self.writer.add_scalar("learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
 
                 if (
-                    iter_num > 0
+                    val_loader is not None
+                    and iter_num > 0
                     and self.train_config.val_every_n_steps != 0
                     and iter_num % self.train_config.val_every_n_steps == 0
                 ):
@@ -238,7 +244,7 @@ class Trainer:
 
                 self.global_step += 1
 
-        if self.train_config.val_after_train:
+        if self.train_config.val_after_train and val_loader is not None:
             val_loss = self.validate(val_loader)
             self.valid_loss = val_loss
             self.valid_writer.add_scalar("loss", val_loss, self.global_step)
