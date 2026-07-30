@@ -1,27 +1,29 @@
 # Training run configuration.
 # Loaded and validated by src.schemas.RunConfig (see main.py).
 
-run_name: llm_small_sft        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
-exp_name: sft_rusjokes_stp20K_bs16_randinit         # name of this specific experiment within the run
+run_name: llm_small_sft_vision        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
+exp_name: sft_gorovuha_stp5K_bs16_from_checkp         # name of this specific experiment within the run
 seed: 42
 deterministic: true        # force deterministic CUDA/cuDNN algorithms for reproducible runs
 shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
 
-dataset_type: text # ['text', 'token_ids']
-dataset_path: "hf://datasets/IgorVolochay/russian_jokes/dataset.json"
+dataset_type: vision # ['text', 'token_ids', 'vision']
+dataset_path: "gorovuha/ru-image-captions"
 tokenized_dataset_path: null
 test_size: 0.05
 
-valid_texts:
-  - "Заходит в бар"
-  - "Штирлиц пришел домой"
+# Column names in the vision dataset.
+image_field: "image"
+text_field: "capt1"
+
+valid_texts: []
 
 tokenizer:
   cache_dir: "russian_jokes"
   vocab_size: 1024
   special_tokens: ["[EOS]"]
 
-# Model architecture (was MODEL_CONFIGS["small"] in main.py).
+
 model:
   n_layer: 12
   n_head: 12
@@ -36,17 +38,27 @@ model:
   use_mla: false
   latent_dim: 128
 
+vision_adapter:
+  vision_model_repo_id: "openai/clip-vit-base-patch32"
+  input_dim: 768              # CLIP ViT-B/32 hidden size
+  output_dim: 768             # must equal model.hidden_dim
+  num_image_patches: 49       # (224/32)^2 = 49 patch embeddings (CLS dropped)
+  image_start_token: "[IMG_START]"
+  image_token: "[IMG]"
+  image_end_token: "[IMG_END]"
+
+
 trainer:
   save_checkpoint: false
-  pretrained_model_path: null # "llm_small_pretrain/train_stp250K_bs16_fix_tokenizer_ds300K/250000.pkl"
-  pretrained_tokenizer_path: "russian_jokes" # "NotEvilAI_ruwiki_300K_tokenized_msl192"
+  pretrained_model_path: "llm_small_pretrain/train_stp250K_bs16_fix_tokenizer_ds300K/250000.pkl" # null
+  pretrained_tokenizer_path: "NotEvilAI_ruwiki_300K_tokenized_msl192" # "russian_jokes"
   max_seq_len: 192
   batch_size: 16
   learning_rate: 3.0e-4
   weight_decay: 0.01
   clip_grad_norm: 1.0
-  n_steps: 20000
-  val_every_n_steps: 4000
+  n_steps: 5000
+  val_every_n_steps: 100
   val_after_train: true
 
 # PyTorch profiler. Traces are written to runs/pytorch_profiler/<run_name>/<exp_name>_<ts>/.

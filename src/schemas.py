@@ -23,9 +23,24 @@ class TransformerConfig(BaseModel):
     rope_theta: float = 10000.0
     use_mla: bool = False
     latent_dim: int = 128
-    
+
+class VisionAdapterConfig(BaseModel):
+    vision_model_repo_id: str
+    input_dim: int
+    output_dim: int
+    # Number of patch embeddings the vision tower produces (CLS dropped).
+    # openai/clip-vit-base-patch32 @ 224px -> (224/32)^2 = 49 patches.
+    num_image_patches: int = 49
+    # Special tokens injected around the image patch placeholders.
+    image_start_token: str = "[IMG_START]"
+    image_token: str = "[IMG]"
+    image_end_token: str = "[IMG_END]"
+
 
 class TrainerConfig(BaseModel):
+    save_checkpoint: bool = False
+    pretrained_model_path: str | None = None
+    pretrained_tokenizer_path: str | None = None
     max_seq_len: int = 128
     batch_size: int = 16
     learning_rate: float = 3e-4
@@ -34,6 +49,8 @@ class TrainerConfig(BaseModel):
     n_steps: int = 10_000
     val_every_n_steps: int = 1_000
     val_after_train: bool = False
+    num_workers: int = 4
+    prefetch_factor: int = 4
 
 
 class ProfilerConfig(BaseModel):
@@ -69,9 +86,6 @@ class RunConfig(BaseModel):
     deterministic: bool = True
     shuffle_train: bool = False
 
-    # "text": tokenize raw documents on the fly (TextDataset + collator).
-    # "token_ids": load a pre-tokenized .npy of fixed-length blocks
-    #              (TokenIdsDataset, no collator). See tokenized_data_path.
     dataset_type: str = "text"
     dataset_path: str = "hf://datasets/IgorVolochay/russian_jokes/dataset.json"
     # Path to the pre-tokenized (n_blocks, block_len) .npy; used when
@@ -80,8 +94,13 @@ class RunConfig(BaseModel):
     test_size: float = 0.1
     valid_texts: list[str] = []
 
+    # Column names for the "vision" dataset_type.
+    image_field: str = "image"
+    text_field: str = "text"
+
     tokenizer: TokenizerConfig = TokenizerConfig()
     model: TransformerConfig
+    vision_adapter: VisionAdapterConfig | None = None
     trainer: TrainerConfig = TrainerConfig()
     profiler: ProfilerConfig = ProfilerConfig()
 

@@ -38,6 +38,9 @@ model:
   latent_dim: 128
 
 trainer:
+  save_checkpoint: true
+  pretrained_model_path: null
+  pretrained_tokenizer_path: null
   max_seq_len: 192
   batch_size: 16
   learning_rate: 3.0e-4

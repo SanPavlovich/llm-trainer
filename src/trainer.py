@@ -1,17 +1,21 @@
 from pathlib import Path
 import contextlib
 import functools
+import logging
 from tqdm.auto import tqdm
+from typing import Any
 import torch
 from torch import Tensor
 from torch.profiler import profile as Profiler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from transformers import CLIPImageProcessor
 
 from src.schemas import TrainerConfig, ProfilerConfig
 from src.tokenizer.bpe_tokenizer import ByteLevelBPETokenizer
-from src.model import TransformerForCausalLM
 from src.utils import cross_entropy_loss, get_linear_schedule_with_warmup
+
+logger = logging.getLogger(__name__)
 
 
 def trace_handler(prof: Profiler, traces_dir: Path) -> None:
@@ -25,22 +29,25 @@ class Trainer:
         self,
         train_config: TrainerConfig,
         tokenizer: ByteLevelBPETokenizer,
-        model: TransformerForCausalLM,
-        valid_texts: list[str],
+        model: Any,
         tensorboard_dir: Path,
         checkpoint_dir: Path,
         profiler_dir: Path | None = None,
         profiler_config: ProfilerConfig | None = None,
         optimizer: torch.optim.Optimizer|None=None,
         scheduler: torch.optim.lr_scheduler.LRScheduler|None=None,
+        valid_texts: list[str] | None = None,
+        valid_images: dict | None = None,
     ) -> None:
         self.train_config = train_config
         self.checkpoint_dir = checkpoint_dir
         self.profiler_dir = profiler_dir
         self.profiler_config = profiler_config
-        self.valid_texts = valid_texts
         self.tokenizer = tokenizer
         self.model = model
+        self.valid_texts = valid_texts
+        self.valid_images = valid_images
+            
         if optimizer is None:
             self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
                 model.parameters(), 
@@ -67,7 +74,7 @@ class Trainer:
             self.device = "mps"
         else:
             self.device = "cpu"
-        print("running on device", self.device)
+        logger.info(f"running on device {self.device}")
 
     def _build_profiler(self) -> Profiler | None:
         """Create a torch.profiler that traces the configured iteration(s).
@@ -132,12 +139,18 @@ class Trainer:
         self.model.eval()
         val_loss = 0.0
         for batch in tqdm(val_loader, desc="Validating", leave=False):
-            input_ids, attention_mask = batch
-            input_ids = input_ids.to(self.device, non_blocking=True).long()
-            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+            logits = self.model(**batch)
 
-            logits = self.model(input_ids, attention_mask)  # [bs; seq len; vocab size]
-            val_loss += cross_entropy_loss(input_ids, attention_mask, logits)
+            loss_mask = None if "image_ids_mask" not in batch else ~batch["image_ids_mask"].bool()
+            loss = cross_entropy_loss(
+                batch["input_ids"], 
+                batch["attention_mask"], 
+                logits, 
+                loss_mask=loss_mask
+            )
+            val_loss += loss
+
         return val_loss / len(val_loader)
     
     def save_checkpoint(self) -> None:
@@ -155,14 +168,21 @@ class Trainer:
         pass
     
     def log_model_samples(self, text_field: str) -> None:
+        if self.valid_images is not None:
+            self._log_visual_samples(text_field)
+        else:
+            self._log_text_samples(text_field)
+
+    @torch.no_grad()
+    def _log_text_samples(self, text_field):
         result_texts = []
         for text in self.valid_texts:
             input_ids = torch.tensor(self.tokenizer.encode(text)[:-1], device=self.device)[None, :]
             model_output = self.model.generate(
-                input_ids, 
-                max_new_tokens=200, 
-                eos_token_id=self.tokenizer.eos_token_id, 
-                do_sample=True, 
+                input_ids,
+                max_new_tokens=200,
+                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=True,
                 top_k=10
             )
             out_text = self.tokenizer.decode(model_output[0].tolist())
@@ -170,17 +190,63 @@ class Trainer:
 
         for i, (start_text, res_text) in enumerate(zip(self.valid_texts, result_texts)):
             self.writer.add_text(
-                text_field, 
-                f"**sample {i+1}:**\n\n[{res_text[:len(start_text)]}]{res_text[len(start_text):]}", 
+                text_field,
+                f"**sample {i+1}:**\n\n[{res_text[:len(start_text)]}]{res_text[len(start_text):]}",
                 self.global_step
             )
 
+    @torch.no_grad()
+    def _log_visual_samples(self, text_field: str) -> None:
+        """Generate a caption for each fixed validation image and log both the
+        image and the generated text to TensorBoard."""
+        pixel_values = self.valid_images["pixel_values"]          # [K, 3, H, W]
+        display_images = self.valid_images.get("display_images")  # [K, 3, H, W] or None
+        captions = self.valid_images.get("captions")              # list[str] or None
+        num_patches = self.model.adapter_config.num_image_patches
+
+        # image prefix: [IMG_START] [IMG]*P [IMG_END]
+        prefix_ids = (
+            [self.tokenizer.image_start_token_id]
+            + [self.tokenizer.image_token_id] * num_patches
+            + [self.tokenizer.image_end_token_id]
+        )
+        prefix_mask = [False] + [True] * num_patches + [False]
+
+        for i in range(pixel_values.shape[0]):
+            px = pixel_values[i : i + 1].to(self.device, non_blocking=True)  # [1, 3, H, W]
+            input_ids = torch.tensor(prefix_ids, device=self.device)[None, :]  # [1, L0]
+            image_ids_mask = torch.tensor(prefix_mask, device=self.device)[None, :]
+
+            out = self.model.generate(
+                input_ids,
+                pixel_values=px,
+                image_ids_mask=image_ids_mask,
+                max_new_tokens=64,
+                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=True,
+                top_k=10,
+            )
+            # Drop the image-prefix ids; decode only the generated text tail.
+            gen_ids = out[0, len(prefix_ids):].tolist()
+            gen_text = self.tokenizer.decode(gen_ids)
+
+            ref = f"\n\n**reference:** {captions[i]}" if captions else ""
+            self.writer.add_text(
+                text_field,
+                f"**image {i+1}:** \n\n**generated text:**{gen_text}\n\n**reference text:**{ref}",
+                self.global_step,
+            )
+            if display_images is not None:
+                self.writer.add_image(
+                    f"{text_field}/image_{i+1}",
+                    display_images[i],
+                    self.global_step,
+                )
 
     def train(
         self, 
         train_loader: DataLoader, 
-        val_loader: DataLoader | None, 
-        save_checkpoint=True
+        val_loader: DataLoader | None,
     ) -> None:
         self.model.to(self.device)
         self.model.train()
@@ -200,14 +266,18 @@ class Trainer:
                 self._maybe_start_memory_snapshot(iter_num)
 
                 with torch.profiler.record_function("train_step"):
-                    input_ids, attention_mask = batch
-                    input_ids = input_ids.to(self.device, non_blocking=True)
-                    attention_mask = attention_mask.to(self.device, non_blocking=True)
-
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with torch.profiler.record_function("model_forward"):
-                        logits = self.model(input_ids, attention_mask)  # [bs; seq len; vocab size]
+                        logits = self.model(**batch)  # [bs; seq len; vocab size]
                     with torch.profiler.record_function("cross_entropy_loss"):
-                        loss = cross_entropy_loss(input_ids, attention_mask, logits)
+                        # For the VLM, skip [IMG] placeholder targets in the loss:
+                        # they aren't real language, so predicting them is meaningless.
+                        loss_mask = None
+                        if "image_ids_mask" in batch:
+                            loss_mask = ~batch["image_ids_mask"].bool()
+                        loss = cross_entropy_loss(
+                            batch["input_ids"], batch["attention_mask"], logits, loss_mask=loss_mask
+                        )
                     with torch.profiler.record_function("loss_backward"):
                         loss.backward()
                     with torch.profiler.record_function("clip_grad_norm"):
@@ -233,7 +303,7 @@ class Trainer:
                     self.log_model_samples(text_field=f"model samples step {self.global_step}")
                     self.model.train()
 
-                    if save_checkpoint:
+                    if self.train_config.save_checkpoint:
                         self.save_checkpoint()
 
                 self._maybe_dump_memory_snapshot(iter_num)
@@ -250,5 +320,5 @@ class Trainer:
             self.valid_writer.add_scalar("loss", val_loss, self.global_step)
             self.log_model_samples(text_field="model samples train end")
         
-        if save_checkpoint:
+        if self.train_config.save_checkpoint:
             self.save_checkpoint()

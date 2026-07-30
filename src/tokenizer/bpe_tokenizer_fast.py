@@ -259,7 +259,7 @@ def train(data, vocab_size: int = 1024, special_tokens=None):
     # --- 1. Build the deduplicated word corpus (string side, in Python) ---
     # Same as the base trainer: split into words and count unique byte-tuples.
     words_by_bytes = Counter()
-    for sample in tqdm(data, desc="Loading data"):
+    for sample in tqdm(data, desc="[train fast tokenizer] Loading data:"):
         for word in WHITESPACE_SPLITTER.findall(sample.strip()):
             bt = word.encode("utf-8")
             if bt:
@@ -339,6 +339,14 @@ class FastByteLevelBPETokenizer:
         self.eos_token_id = vocab[eos_token]
         self.merges = merges
 
+        # Image special tokens (populated on demand by add_image_tokens()).
+        self.image_start_token: str | None = None
+        self.image_token: str | None = None
+        self.image_end_token: str | None = None
+        self.image_start_token_id: int | None = None
+        self.image_token_id: int | None = None
+        self.image_end_token_id: int | None = None
+
         self._byte_encoder = bytes_to_unicode()  # int byte -> unicode char
         self._byte_decoder = {v: k for k, v in self._byte_encoder.items()}
 
@@ -376,6 +384,32 @@ class FastByteLevelBPETokenizer:
             pretrained_model_name_or_path, token=token, **model_kwargs
         )
         return cls.from_tokenizer(base)
+
+    def add_image_tokens(
+        self,
+        image_start_token: str = "[IMG_START]",
+        image_token: str = "[IMG]",
+        image_end_token: str = "[IMG_END]",
+    ) -> "FastByteLevelBPETokenizer":
+        """Append image special tokens to the vocab in place; returns self.
+
+        These ids are never emitted by encode() (image tokens don't participate
+        in BPE merges), so the njit pair matrices need no resizing — they only
+        need to exist in id2token so decode() can skip them.
+        """
+        for tok in (image_start_token, image_token, image_end_token):
+            if tok not in self.token2id:
+                new_id = len(self.token2id)
+                self.token2id[tok] = new_id
+                self.id2token[new_id] = tok
+
+        self.image_start_token = image_start_token
+        self.image_token = image_token
+        self.image_end_token = image_end_token
+        self.image_start_token_id = self.token2id[image_start_token]
+        self.image_token_id = self.token2id[image_token]
+        self.image_end_token_id = self.token2id[image_end_token]
+        return self
 
     # -- internals ---------------------------------------------------------
 
@@ -424,8 +458,13 @@ class FastByteLevelBPETokenizer:
         """Convert token ids back to text (same logic as the base tokenizer)."""
         out_parts: list[str] = []
         byte_buf: list[int] = []
+        skip_ids = {self.eos_token_id}
+        skip_ids.update(
+            tid for tid in (self.image_start_token_id, self.image_token_id, self.image_end_token_id)
+            if tid is not None
+        )
         for tid in idx:
-            if tid == self.eos_token_id:
+            if tid in skip_ids:
                 continue
             tok = self.id2token[tid]
             all_base = all(ch in self._byte_decoder for ch in tok)

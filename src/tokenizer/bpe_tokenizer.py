@@ -174,6 +174,46 @@ class ByteLevelBPETokenizer:
         self.merges = merges
         self.bpe_ranks = {pair: i for i, pair in enumerate(merges)}
 
+        # Image special tokens are populated on demand by add_image_tokens().
+        self.image_start_token: str | None = None
+        self.image_token: str | None = None
+        self.image_end_token: str | None = None
+        self.image_start_token_id: int | None = None
+        self.image_token_id: int | None = None
+        self.image_end_token_id: int | None = None
+
+    def add_image_tokens(
+        self,
+        image_start_token: str = "[IMG_START]",
+        image_token: str = "[IMG]",
+        image_end_token: str = "[IMG_END]",
+    ) -> "ByteLevelBPETokenizer":
+        """Append image special tokens to the vocabulary in place.
+
+        These tokens are NOT produced by BPE encoding of normal text; they only
+        ever enter a sequence programmatically (see VisualTextDataset). Adding
+        them here simply reserves new ids at the tail of the vocab, so a text
+        pretrain checkpoint stays compatible — you only need to grow the model
+        embedding / lm_head by ``len(new_tokens)`` rows.
+
+        Idempotent: re-adding tokens already present just re-reads their ids.
+
+        Returns ``self`` for chaining.
+        """
+        for tok in (image_start_token, image_token, image_end_token):
+            if tok not in self.token2id:
+                new_id = len(self.token2id)
+                self.token2id[tok] = new_id
+                self.id2token[new_id] = tok
+
+        self.image_start_token = image_start_token
+        self.image_token = image_token
+        self.image_end_token = image_end_token
+        self.image_start_token_id = self.token2id[image_start_token]
+        self.image_token_id = self.token2id[image_token]
+        self.image_end_token_id = self.token2id[image_end_token]
+        return self
+
     @lru_cache
     def bpe(self, word: tuple[str]) -> tuple[str]:
         """Process word into tokenized representation.
@@ -258,9 +298,15 @@ class ByteLevelBPETokenizer:
         """
         out_parts: list[str] = []
         byte_buf: list[int] = []
-        
+
+        skip_ids = {self.eos_token_id}
+        skip_ids.update(
+            tid for tid in (self.image_start_token_id, self.image_token_id, self.image_end_token_id)
+            if tid is not None
+        )
+
         for tid in idx:
-            if tid == self.eos_token_id:
+            if tid in skip_ids:
                 continue
             tok = self.id2token[tid]
             all_base = True

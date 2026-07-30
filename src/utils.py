@@ -67,7 +67,12 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def cross_entropy_loss(input_ids: Tensor, attention_mask: Tensor, logits: Tensor) -> Tensor:
+def cross_entropy_loss(
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    logits: Tensor,
+    loss_mask: Tensor | None = None,
+) -> Tensor:
     """Calculate Cross-Entropy loss for Language Modeling task
     Under the hood:
     1. Create targtes based on input ids
@@ -78,12 +83,17 @@ def cross_entropy_loss(input_ids: Tensor, attention_mask: Tensor, logits: Tensor
         input_ids: tensor with input ids, shape [bs, seq len]
         attention_mask: mask with zeros for pad tokens, shape [bs, seq len]
         logits: predicted logits, shape [bs, seq len, vocab size]
+        loss_mask: optional bool mask, True where a target position should be INCLUDED in the loss.
     Return:
         cross entropy loss, single-item tensor
     """
     n_logits = logits[:, :-1, :].contiguous()
     labels = input_ids[:, 1:].contiguous()
     mask   = attention_mask[:, 1:].contiguous()
+
+    if loss_mask is not None:
+        # Only keep positions that are both non-pad AND flagged for loss.
+        mask = mask & loss_mask[:, 1:].contiguous().to(mask.dtype).bool()
 
     # лосс покадрово без усреднения
     loss_tok = F.cross_entropy(
