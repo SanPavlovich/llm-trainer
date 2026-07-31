@@ -54,6 +54,8 @@ class TrainerConfig(BaseModel):
     val_after_train: bool = False
     num_workers: int = 4
     prefetch_factor: int = 4
+    mixed_precision: bool = False
+    amp_dtype: str = "bfloat16"   # ['bfloat16', 'float16']; float16 also enables GradScaler
 
 
 class ProfilerConfig(BaseModel):

@@ -76,6 +76,35 @@ class Trainer:
             self.device = "cpu"
         logger.info(f"running on device {self.device}")
 
+        self._setup_amp()
+
+    def _setup_amp(self) -> None:
+        """Configure mixed-precision (autocast) state from the trainer config.
+
+        bf16 needs no GradScaler; fp16 does, so a scaler is created only then.
+        AMP is disabled on CPU (no autocast benefit here) even if requested.
+        """
+        dtypes = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+        self.amp_dtype = dtypes.get(self.train_config.amp_dtype, torch.bfloat16)
+        self.amp_enabled = bool(self.train_config.mixed_precision) and self.device == "cuda"
+
+        # GradScaler is required for fp16 (to avoid gradient underflow); bf16 has
+        # the same exponent range as fp32 and does not need it.
+        use_scaler = self.amp_enabled and self.amp_dtype == torch.float16
+        self.scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+        if self.amp_enabled:
+            logger.info(f"mixed precision enabled: autocast dtype={self.amp_dtype}, "
+                        f"grad_scaler={'on' if use_scaler else 'off'}")
+
+    def _autocast(self):
+        """Autocast context for the forward/loss; a no-op when AMP is disabled."""
+        return torch.autocast(
+            device_type=self.device if self.device != "mps" else "cpu",
+            dtype=self.amp_dtype,
+            enabled=self.amp_enabled,
+        )
+
     def _build_profiler(self) -> Profiler | None:
         """Create a torch.profiler that traces the configured iteration(s).
 
@@ -146,16 +175,17 @@ class Trainer:
         val_loss = 0.0
         for batch in tqdm(val_loader, desc="Validating", leave=False):
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-            logits = self.model(**batch)
-
-            loss_mask = None if "image_ids_mask" not in batch else ~batch["image_ids_mask"].bool()
-            loss = cross_entropy_loss(
-                batch["input_ids"], 
-                batch["attention_mask"], 
-                logits, 
-                loss_mask=loss_mask
-            )
-            val_loss += loss
+            with self._autocast():
+                logits = self.model(**batch)
+                loss_mask = None if "image_ids_mask" not in batch else ~batch["image_ids_mask"].bool()
+                loss = cross_entropy_loss(
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    logits,
+                    loss_mask=loss_mask
+                )
+            # accumulate in fp32 to avoid drift over many val batches
+            val_loss += loss.float()
 
         return val_loss / len(val_loader)
     
@@ -165,6 +195,7 @@ class Trainer:
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
+            "scaler": self.scaler.state_dict(),
             "step": self.global_step,
             "train_loss": self.train_loss,
             "valid_loss": self.valid_loss,
@@ -274,22 +305,29 @@ class Trainer:
 
                 with torch.profiler.record_function("train_step"):
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                    with torch.profiler.record_function("model_forward"):
-                        logits = self.model(**batch)  # [bs; seq len; vocab size]
-                    with torch.profiler.record_function("cross_entropy_loss"):
-                        # For the VLM, skip [IMG] placeholder targets in the loss:
-                        # they aren't real language, so predicting them is meaningless.
-                        loss_mask = None
-                        if "image_ids_mask" in batch:
-                            loss_mask = ~batch["image_ids_mask"].bool()
-                        loss = cross_entropy_loss(
-                            batch["input_ids"], batch["attention_mask"], logits, loss_mask=loss_mask
-                        )
+                    # Forward + loss run under autocast (bf16/fp16); precision-
+                    # sensitive ops (softmax, cross-entropy, RMSNorm, RoPE) stay fp32.
+                    with self._autocast():
+                        with torch.profiler.record_function("model_forward"):
+                            logits = self.model(**batch)  # [bs; seq len; vocab size]
+                        with torch.profiler.record_function("cross_entropy_loss"):
+                            # For the VLM, skip [IMG] placeholder targets in the loss:
+                            # they aren't real language, so predicting them is meaningless.
+                            loss_mask = None
+                            if "image_ids_mask" in batch:
+                                loss_mask = ~batch["image_ids_mask"].bool()
+                            loss = cross_entropy_loss(
+                                batch["input_ids"], batch["attention_mask"], logits, loss_mask=loss_mask
+                            )
                     with torch.profiler.record_function("loss_backward"):
-                        loss.backward()
+                        # scaler is a no-op unless fp16 AMP is on.
+                        self.scaler.scale(loss).backward()
                     with torch.profiler.record_function("clip_grad_norm"):
+                        # Unscale before clipping so the norm/threshold are in true units.
+                        self.scaler.unscale_(self.optimizer)
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.clip_grad_norm)
-                    self.optimizer.step()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                     self.optimizer.zero_grad()
                     self.scheduler.step()
 

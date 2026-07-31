@@ -22,9 +22,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        rms = x.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x * torch.rsqrt(rms + self.eps)
-        return self.weight * x_norm
+        # Normalize in fp32 for numerical stability under autocast (bf16/fp16):
+        in_dtype = x.dtype
+        x_fp32 = x.float()
+        rms = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_fp32 * torch.rsqrt(rms + self.eps)
+        out = self.weight.float() * x_norm
+        return out.to(in_dtype)
 
 
 def build_rmsnorm(config: TransformerConfig) -> nn.Module:
