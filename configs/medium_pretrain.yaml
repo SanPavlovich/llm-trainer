@@ -1,0 +1,72 @@
+# Training run configuration.
+# Loaded and validated by src.schemas.RunConfig (see main.py).
+#
+# ~300M-parameter ("medium") text SFT. Parallel to small_sft.yaml but with a
+# 24-layer / 1024-dim transformer (GQA 16:8 heads, RoPE, SwiGLU). Instantiating
+# TransformerForCausalLM with this model block reports 304.3M parameters.
+
+run_name: llm_medium_pretrain        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
+exp_name: train_stp250K_bs16_ds300K_randinit         # name of this specific experiment within the run
+seed: 42
+deterministic: true        # force deterministic CUDA/cuDNN algorithms for reproducible runs
+shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
+
+dataset_type: token_ids # ['text', 'token_ids', 'vision']
+tokenized_dataset_path: "NotEvilAI_ruwiki_300K_tokenized_msl192.npy"
+test_size: 0.01
+
+valid_texts:
+  - "Заходит в бар"
+  - "Штирлиц пришел домой"
+
+tokenizer:
+  cache_dir: "NotEvilAI_ruwiki_300K_tokenized_msl192"
+  vocab_size: 1024
+  special_tokens: ["[EOS]"]
+
+# Model architecture: ~304M params.
+model:
+  n_layer: 24
+  n_head: 16
+  n_kv_head: 8             # GQA: 16 query heads share 8 KV heads (2:1)
+  hidden_dim: 1024
+  intermediate_dim: 3072   # SwiGLU inner dim; tuned so the model lands at ~300M
+  dropout: 0.1
+  vocab_size: 1024
+  max_seq_len: 192
+  use_rope: true
+  rope_theta: 10000.0
+  use_mla: false
+  latent_dim: 128
+
+trainer:
+  save_checkpoint: true
+  pretrained_model_path: null
+  pretrained_tokenizer_path: "NotEvilAI_ruwiki_300K_tokenized_msl192"
+  max_seq_len: 192
+  batch_size: 16            # halved vs small: the medium model needs ~4x the activation memory
+  learning_rate: 2.0e-4    # lower LR for the larger model
+  weight_decay: 0.01
+  clip_grad_norm: 1.0
+  n_steps: 250000
+  val_every_n_steps: 10000
+  val_after_train: true
+  num_workers: 8
+  prefetch_factor: 4
+
+# PyTorch profiler. Traces are written to runs/pytorch_profiler/<run_name>/<exp_name>_<ts>/.
+# The schedule is wait -> warmup -> active. To trace the 10th iteration:
+# wait=9, warmup=0, active=1 (iterations are 0-indexed internally).
+profiler:
+  enabled: true
+  wait: 8          # skip the first 9 iterations
+  warmup: 1        # no warmup
+  active: 1        # record 1 iteration (the 10th)
+  repeat: 1        # only one wait/warmup/active cycle
+  record_shapes: true
+  profile_memory: true
+  with_stack: false
+  # CUDA memory snapshot of a single iteration (viewable at https://pytorch.org/memory_viz)
+  memory_snapshot: true
+  memory_snapshot_step: 9        # iter_num (0-indexed) to snapshot => the 10th iteration
+  memory_snapshot_max_entries: 100000

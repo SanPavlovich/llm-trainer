@@ -21,22 +21,6 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 class TokenIdsDataset(torch.utils.data.Dataset):
-    """Dataset over a pre-tokenized corpus stored as fixed-length blocks.
-
-    Expects a ``.npy`` file of shape ``(n_blocks, block_len)`` produced by the
-    offline tokenization step (see eda/pretrain_dataset.ipynb): each row is one
-    already-packed block of token ids of length ``block_len``.
-
-    Because every block is already the right length and fully populated with
-    real tokens, there is nothing to pad or truncate at load time — no collator
-    is needed. ``__getitem__`` returns ``(input_ids, attention_mask)`` directly,
-    matching the tuple that :func:`data_collator` produces, so the training loop
-    is unchanged. The attention mask is all-ones (no padding in packed blocks).
-
-    The array is memory-mapped, so the full corpus is never loaded into RAM;
-    only the requested rows are read from disk.
-    """
-
     def __init__(self, path, max_seq_len: int | None = None):
         # mmap_mode='r' keeps the corpus on disk; rows are read lazily.
         self.data = np.load(path, mmap_mode="r")
@@ -52,12 +36,14 @@ class TokenIdsDataset(torch.utils.data.Dataset):
         return self.data.shape[0]
 
     def __getitem__(self, idx):
-        # Copy out of the memmap into an owned int64 tensor for the model.
         block = np.asarray(self.data[idx, : self.seq_len], dtype=np.int64)
         input_ids = torch.from_numpy(block)
-        # No padding inside a packed block -> every position attends.
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        return input_ids, attention_mask
+
+        return {
+            "input_ids": input_ids, 
+            "attention_mask": attention_mask
+        }
 
 
 class VisualTextDataset(torch.utils.data.Dataset):
@@ -130,6 +116,18 @@ class VisualTextDataset(torch.utils.data.Dataset):
             "image_ids_mask": image_ids_mask,
         }
 
+
+def flatten_collator(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    input_ids = []
+    attention_mask =[]
+    for b in batch:
+        input_ids.append(b["input_ids"])
+        attention_mask.append(b["attention_mask"])
+
+    return {
+        "input_ids": torch.stack(input_ids), 
+        "attention_mask": torch.stack(attention_mask)
+    }
 
 def pad_sequences(
     tokenized_sequences: list[list[int]], pad_token_id: int, max_seq_len: int = None
@@ -239,5 +237,5 @@ def create_token_ids_dataloader(
     the training loop expects from :func:`create_dataloader`.
     """
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, pin_memory=True
+        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, collate_fn=flatten_collator, pin_memory=True
     )

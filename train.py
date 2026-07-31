@@ -103,6 +103,32 @@ def tokenize_dataset(
     return
 
 
+def get_valid_images(split):
+    # Fix 5 random validation images once; we caption these every eval so
+    # progress is visually comparable across steps.
+    rng = np.random.default_rng(config.seed)
+    n_fixed = min(5, len(split["test"]))
+    fixed_idx = rng.choice(len(split["test"]), size=n_fixed, replace=False).tolist()
+
+    fixed_pixel_values, fixed_display, fixed_captions = [], [], []
+    for j in fixed_idx:
+        row = split["test"][int(j)]
+        pil_img = row[config.image_field]
+        proc = image_processor(pil_img, return_tensors="pt")["pixel_values"][0]  # [3,H,W]
+        fixed_pixel_values.append(proc)
+        # Display copy: original image resized/normalized to 0..1 for TensorBoard.
+        disp = image_processor(pil_img, return_tensors="pt", do_normalize=False)["pixel_values"][0]
+        fixed_display.append(disp.clamp(0, 1))
+        cap = row[config.text_field]
+        fixed_captions.append(cap if isinstance(cap, str) else str(cap))
+
+    return {
+        "pixel_values": torch.stack(fixed_pixel_values),
+        "display_images": torch.stack(fixed_display),
+        "captions": fixed_captions,
+    }
+
+
 if __name__ == "__main__":
     args = parse_args()
     config = RunConfig.from_yaml(args.config)
@@ -117,6 +143,7 @@ if __name__ == "__main__":
     root_dir = Path(__file__).resolve().parent
     exp_subdir = root_dir/ "runs" / config.run_name / f"{config.exp_name}_{time_str_format}"
     checkpoint_dir = root_dir / "model_checkpoint" / config.run_name / f"{config.exp_name}_{time_str_format}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     tensorboard_dir = exp_subdir / "tensorboard"
     profiler_dir = exp_subdir / "pytorch_profiler"
@@ -129,6 +156,7 @@ if __name__ == "__main__":
     tokenizer_cache_dir = root_dir / "tokenizer_cache"
     tokenizer_cache_dir_full = tokenizer_cache_dir / config.tokenizer.cache_dir
     tokenizer_cache_dir_full.mkdir(parents=True, exist_ok=True)
+    pretrained_tokenizer_cache_dir = root_dir / "tokenizer_cache" / train_config.pretrained_tokenizer_path
 
     # 169K samples - 561_063_303 tokens
     # 300K samples - 749_678_477 tokens
@@ -146,6 +174,7 @@ if __name__ == "__main__":
         tokenized_dataset_dir = root_dir / "datasets" / config.tokenized_dataset_path
     
         if not os.path.exists(tokenized_dataset_dir):
+            logger.info(f"start training tokenizer on dataset: {dataset_dir}")
             dataset = load_from_disk(str(dataset_dir))
             vocab_fast, merges_fast = tokenizer_fast_train(
                 data=dataset["text"], 
@@ -156,14 +185,17 @@ if __name__ == "__main__":
             save_tokenizer_files(path=tokenizer_cache_dir_full, vocab=vocab_fast, merges=merges_fast)
             tokenizer = ByteLevelBPETokenizer.from_pretrained(tokenizer_cache_dir_full)
 
+            logger.info(f"start dataset tokenization: {dataset_dir}")
             tokenize_dataset(
                 texts=dataset["text"], 
                 max_seq_len=train_config.max_seq_len, 
                 out_path=root_dir / "datasets" / config.tokenized_dataset_path,
                 tokenizer=tokenizer
             )
+            logger.info(f"tokenized dataset saved at {root_dir / "datasets" / config.tokenized_dataset_path}")
         else:
-            tokenizer = ByteLevelBPETokenizer.from_pretrained(tokenizer_cache_dir_full)
+            logger.info(f"pretrained tokenizer loaded from {pretrained_tokenizer_cache_dir}")
+            tokenizer = ByteLevelBPETokenizer.from_pretrained(pretrained_tokenizer_cache_dir)
 
         full_dataset = TokenIdsDataset(
             path=root_dir / "datasets" / config.tokenized_dataset_path, 
@@ -188,12 +220,10 @@ if __name__ == "__main__":
         # Image + text SFT. Load a pretrained tokenizer, add image special
         # tokens, then build image/text pairs for the multimodal collator.
         from functools import partial
-        from transformers import CLIPImageProcessor
 
         assert config.vision_adapter is not None, "vision dataset_type requires a vision_adapter config"
         va = config.vision_adapter
 
-        pretrained_tokenizer_cache_dir = root_dir / "tokenizer_cache" / train_config.pretrained_tokenizer_path
         tokenizer = ByteLevelBPETokenizer.from_pretrained(pretrained_tokenizer_cache_dir)
         tokenizer.add_image_tokens(
             image_start_token=va.image_start_token,
@@ -246,39 +276,14 @@ if __name__ == "__main__":
             test_dataset, batch_size=train_config.batch_size, shuffle=False,
             drop_last=False, **loader_kwargs,
         )
-
-        # Fix 5 random validation images once; we caption these every eval so
-        # progress is visually comparable across steps.
-        rng = np.random.default_rng(config.seed)
-        n_fixed = min(5, len(split["test"]))
-        fixed_idx = rng.choice(len(split["test"]), size=n_fixed, replace=False).tolist()
-
-        fixed_pixel_values, fixed_display, fixed_captions = [], [], []
-        for j in fixed_idx:
-            row = split["test"][int(j)]
-            pil_img = row[config.image_field]
-            proc = image_processor(pil_img, return_tensors="pt")["pixel_values"][0]  # [3,H,W]
-            fixed_pixel_values.append(proc)
-            # Display copy: original image resized/normalized to 0..1 for TensorBoard.
-            disp = image_processor(pil_img, return_tensors="pt", do_normalize=False)["pixel_values"][0]
-            fixed_display.append(disp.clamp(0, 1))
-            cap = row[config.text_field]
-            fixed_captions.append(cap if isinstance(cap, str) else str(cap))
-
-        valid_images = {
-            "pixel_values": torch.stack(fixed_pixel_values),
-            "display_images": torch.stack(fixed_display),
-            "captions": fixed_captions,
-        }
+        valid_images = get_valid_images(split)
     else:
         dataset = load_dataset("json", data_files=config.dataset_path)
         dataset = dataset["train"].train_test_split(test_size=config.test_size, seed=config.seed)
-        pretrained_tokenizer_cache_dir = root_dir / "tokenizer_cache" / train_config.pretrained_tokenizer_path
-        logger.info(f"{pretrained_tokenizer_cache_dir=}")
 
         if os.path.exists(pretrained_tokenizer_cache_dir / "vocabulary.json") and os.path.exists(pretrained_tokenizer_cache_dir / "merges.json"):
             tokenizer = ByteLevelBPETokenizer.from_pretrained(pretrained_tokenizer_cache_dir)
-            logger.info("pretrained tokenizer loaded")
+            logger.info(f"pretrained tokenizer loaded from {pretrained_tokenizer_cache_dir}")
         else:
             vocab, merges = tokenizer_train(data=dataset["train"]["jokes"], **tokenizer_config.model_dump())
             save_tokenizer_files(tokenizer_cache_dir_full, vocab, merges)
@@ -331,6 +336,7 @@ if __name__ == "__main__":
     logger.info(f"Number of trainable parameters: {model.n_trainable_params / 1e6:.2f}M")
     logger.info(f"train_loader iterations count: {len(train_dataloader):_}")
     logger.info(f"val_loader   iterations count: {len(test_dataloader):_}")
+
     trainer = Trainer(
         tokenizer=tokenizer,
         model=model,

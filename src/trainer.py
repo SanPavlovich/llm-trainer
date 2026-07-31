@@ -163,6 +163,7 @@ class Trainer:
             "train_loss": self.train_loss,
             "valid_loss": self.valid_loss,
         }, checkpoint_name)
+        logger.info(f"step {self.global_step}; checkpoint saved at {checkpoint_name}")
     
     def load_checkpoint(self,) -> None:
         pass
