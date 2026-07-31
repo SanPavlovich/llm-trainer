@@ -113,9 +113,12 @@ class Trainer:
             and self.profiler_dir is not None
         )
 
+    def _memory_snapshot_stop_step(self) -> int:
+        cfg = self.profiler_config
+        stop = cfg.memory_snapshot_stop_step
+        return cfg.memory_snapshot_step if stop is None else stop
+
     def _maybe_start_memory_snapshot(self, iter_num: int) -> None:
-        """Start recording CUDA allocation history one iteration before the target,
-        so the snapshot captures exactly the target iteration's allocations."""
         if not self._memory_snapshot_enabled():
             return
         if iter_num == self.profiler_config.memory_snapshot_step - 1:
@@ -124,15 +127,18 @@ class Trainer:
             )
 
     def _maybe_dump_memory_snapshot(self, iter_num: int) -> None:
-        """Dump and stop recording right after the target iteration."""
+        """Dump and stop recording right after the last target iteration."""
         if not self._memory_snapshot_enabled():
             return
-        if iter_num == self.profiler_config.memory_snapshot_step:
+        start = self.profiler_config.memory_snapshot_step
+        stop = self._memory_snapshot_stop_step()
+        if iter_num == stop:
             self.profiler_dir.mkdir(parents=True, exist_ok=True)
-            snapshot_path = self.profiler_dir / f"memory_snapshot_step{iter_num}.pickle"
+            span = f"step{start}" if start == stop else f"steps{start}-{stop}"
+            snapshot_path = self.profiler_dir / f"memory_snapshot_{span}.pickle"
             torch.cuda.memory._dump_snapshot(str(snapshot_path))
             torch.cuda.memory._record_memory_history(enabled=None)  # stop & free buffer
-            print(f"CUDA memory snapshot saved to {snapshot_path}")
+            logger.info(f"CUDA memory snapshot saved to {snapshot_path}")
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Tensor:

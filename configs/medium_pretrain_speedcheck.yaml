@@ -6,7 +6,7 @@
 # TransformerForCausalLM with this model block reports 304.3M parameters.
 
 run_name: llm_medium_pretrain        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
-exp_name: speedcheck_train_stp100_bs16_ds300K_randinit         # name of this specific experiment within the run
+exp_name: speedcheck_flashattn_refactor_train_stp100_bs16_ds300K_randinit         # name of this specific experiment within the run
 seed: 42
 deterministic: true        # force deterministic CUDA/cuDNN algorithms for reproducible runs
 shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
@@ -38,6 +38,8 @@ model:
   rope_theta: 10000.0
   use_mla: false
   latent_dim: 128
+  attn_impl: eager          # ['eager', 'sdpa']; sdpa -> FlashAttention-2 kernel (RoPE only)
+  rmsnorm_impl: torch      # ['custom', 'torch']; torch -> fused torch.nn.RMSNorm
 
 trainer:
   save_checkpoint: false
@@ -58,15 +60,16 @@ trainer:
 # The schedule is wait -> warmup -> active. To trace the 10th iteration:
 # wait=9, warmup=0, active=1 (iterations are 0-indexed internally).
 profiler:
-  enabled: true
-  wait: 8          # skip the first 9 iterations
-  warmup: 1        # no warmup
-  active: 1        # record 1 iteration (the 10th)
+  enabled: false
+  wait: 9          # skip the first 9 iterations (0..8) as warmup
+  warmup: 0        # no separate warmup phase
+  active: 10       
   repeat: 1        # only one wait/warmup/active cycle
   record_shapes: true
   profile_memory: true
   with_stack: false
-  # CUDA memory snapshot of a single iteration (viewable at https://pytorch.org/memory_viz)
-  memory_snapshot: true
-  memory_snapshot_step: 9        # iter_num (0-indexed) to snapshot => the 10th iteration
-  memory_snapshot_max_entries: 100000
+  # CUDA memory snapshot across the range of iterations (viewable at https://pytorch.org/memory_viz).
+  memory_snapshot: false
+  memory_snapshot_step: 9
+  memory_snapshot_stop_step: 18
+  memory_snapshot_max_entries: 1000000

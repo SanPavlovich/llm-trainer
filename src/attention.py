@@ -1,9 +1,90 @@
+import logging
+from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 from src.schemas import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
+
+def build_causal_key_mask(
+    attention_mask: Tensor | None,
+    L: int,
+    B: int,
+    device: torch.device,
+) -> Tensor:
+    causal = torch.ones(L, L, dtype=torch.bool, device=device).tril().view(1, 1, L, L)
+
+    if attention_mask is None:
+        return causal.expand(B, 1, L, L)
+
+    key_mask = attention_mask
+    if key_mask.dim() > 2:
+        key_mask = key_mask[..., 0]
+    key_mask = (key_mask > 0).view(B, 1, 1, L)  # True = keep
+    return causal & key_mask  # [B, 1, L, L]
+
+
+def eager_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attention_mask: Tensor | None,
+    dropout_p: float,
+    scale: float,
+    attn_dropout: nn.Module,
+    alibi_bias: Tensor | None = None,
+) -> Tensor:
+    B, H, L, _ = q.shape
+    att = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, L, L]
+
+    if alibi_bias is not None:
+        i = torch.arange(L, device=q.device).view(1, 1, L, 1)
+        j = torch.arange(L, device=q.device).view(1, 1, 1, L)
+        att = att + (alibi_bias.to(att.dtype) * (j - i))
+
+    allow = build_causal_key_mask(attention_mask, L, B, q.device)
+    att = att.masked_fill(~allow, torch.finfo(att.dtype).min)
+
+    att = F.softmax(att, dim=-1)
+    att = attn_dropout(att)
+    return torch.matmul(att, v)
+
+
+def sdpa_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attention_mask: Tensor | None,
+    dropout_p: float,
+    scale: float,
+    attn_dropout: nn.Module | None = None,   # unused; SDPA applies dropout internally
+    alibi_bias: Tensor | None = None,        # unused; sdpa is RoPE-only
+) -> Tensor:
+    B, H, L, _ = q.shape
+
+    if attention_mask is None:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
+        )
+
+    allow = build_causal_key_mask(attention_mask, L, B, q.device)  # [B, 1, L, L] bool
+    # Additive float mask: 0 where allowed, -inf where masked.
+    attn_bias = torch.zeros(B, 1, L, L, dtype=q.dtype, device=q.device)
+    attn_bias = attn_bias.masked_fill(~allow, torch.finfo(q.dtype).min)
+
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_bias, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+ATTENTION_IMPLEMENTATIONS = {
+    "eager": eager_attention,
+    "sdpa": sdpa_attention
+}
 
 
 class CausalSelfAttentionMLA(nn.Module):
@@ -15,6 +96,12 @@ class CausalSelfAttentionMLA(nn.Module):
         self.head_dim = self.config.hidden_dim // self.config.n_head
         self.scale = self.head_dim ** -0.5
         self.q_per_kv = self.config.n_head // self.config.n_kv_head
+        self.attention_interface: Callable = ATTENTION_IMPLEMENTATIONS[config.attn_impl]
+        # SDPA can't apply our ALiBi bias, so it is RoPE-only.
+        assert not (self.config.attn_impl == "sdpa" and not self.config.use_rope), (
+            "attn_impl='sdpa' is not supported with ALiBi (use_rope=False); "
+            "use attn_impl='eager' for ALiBi."
+        )
 
         self.q_proj = nn.Linear(self.config.hidden_dim, self.config.n_head * self.head_dim, bias=False)
 
@@ -70,30 +157,28 @@ class CausalSelfAttentionMLA(nn.Module):
             q = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
             k = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
 
-        att = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B,H,L,L]
+        # ALiBi bias only for the eager path without RoPE; None otherwise.
+        alibi_bias = None if self.config.use_rope else self.alibi
+        dropout_p = self.attn_dropout.p if self.training else 0.0
 
-        if not self.config.use_rope:
-            i = torch.arange(L, device=x.device).view(1, 1, L, 1)
-            j = torch.arange(L, device=x.device).view(1, 1, 1, L)
-            att = att + (self.alibi.to(att.dtype) * (j - i))
+        y = self.attention_interface(
+            q,
+            k,
+            v,
+            attention_mask,
+            dropout_p=dropout_p,
+            scale=self.scale,
+            attn_dropout=self.attn_dropout,
+            alibi_bias=alibi_bias,
+        )
 
-        att = att.masked_fill(~self.causal_mask[:, :, :L, :L], torch.finfo(att.dtype).min)
-        if attention_mask is not None:
-            key_mask = attention_mask if attention_mask.dim() == 2 else attention_mask[..., 0]
-            key_mask = (key_mask > 0).view(B, 1, 1, L)
-            att = att.masked_fill(~key_mask, torch.finfo(att.dtype).min)
-
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        y = torch.matmul(att, v)
         y = y.permute(0, 2, 1, 3).contiguous().view(B, L, self.config.n_head * self.head_dim)
         y = self.out_proj(y)
         return y
     
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig) -> None:
         """Causal Self-Attention with support of
         Grouped-Query Attention and ALiBi for positional encoding
         """
@@ -104,6 +189,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.config.hidden_dim // self.config.n_head
         self.scale = self.head_dim**-0.5
         self.q_per_kv = self.config.n_head // self.config.n_kv_head
+        self.attention_interface: Callable = ATTENTION_IMPLEMENTATIONS[config.attn_impl]
 
         # Init projection layers
         self.q_proj  = nn.Linear(self.config.hidden_dim, self.config.n_head * self.head_dim, bias=False)
@@ -114,8 +200,13 @@ class CausalSelfAttention(nn.Module):
 
         self.register_buffer("causal_mask", self._create_causal_mask(self.config.max_seq_len))
         self.register_buffer("alibi", self._build_alibi_bias(self.config.n_head))
+        # SDPA can't apply our ALiBi bias, so it is RoPE-only.
+        assert not (self.config.attn_impl == "sdpa" and not self.config.use_rope), (
+            "attn_impl='sdpa' is not supported with ALiBi (use_rope=False); "
+            "use attn_impl='eager' for ALiBi."
+        )
 
-        # тут RoPE
+        # RoPE
         half = self.head_dim // 2
         inv = 1.0 / (self.config.rope_theta ** (torch.arange(half, dtype=torch.float32) / half))
         self.register_buffer("rope_inv_freq", inv, persistent=False)
@@ -180,28 +271,21 @@ class CausalSelfAttention(nn.Module):
             q = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
             k = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
 
-        
-        att = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # ALiBi bias only for the eager path without RoPE; None otherwise.
+        alibi_bias = None if self.config.use_rope else self.alibi
+        dropout_p = self.attn_dropout.p if self.training else 0.0
 
-        if not self.config.use_rope:
-            i = torch.arange(L, device=x.device).view(1, 1, L, 1)
-            j = torch.arange(L, device=x.device).view(1, 1, 1, L)
-            att = att + (self.alibi.to(att.dtype) * (j - i))
+        y = self.attention_interface(
+            q,
+            k,
+            v,
+            attention_mask,
+            dropout_p=dropout_p,
+            scale=self.scale,
+            attn_dropout=self.attn_dropout,
+            alibi_bias=alibi_bias,
+        )
 
-        causal = self.causal_mask[:, :, :L, :L]
-        att = att.masked_fill(~causal, torch.finfo(att.dtype).min)
-
-        if attention_mask is not None:
-            key_mask = attention_mask
-            if key_mask.dim() == 3:
-                key_mask = key_mask[..., 0]
-            key_mask = (key_mask > 0).view(B, 1, 1, L)
-            att = att.masked_fill(~key_mask, torch.finfo(att.dtype).min)
-
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        y = torch.matmul(att, v)
         y = y.permute(0, 2, 1, 3).contiguous().view(B, L, self.config.n_head * self.head_dim)
         y = self.out_proj(y)
         return y

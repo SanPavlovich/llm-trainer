@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn import RMSNorm as TorchRMSNorm
 from huggingface_hub import PyTorchModelHubMixin
 
 from src.attention import CausalSelfAttention, CausalSelfAttentionMLA
@@ -18,12 +19,23 @@ class RMSNorm(nn.Module):
         """
         super().__init__()
         self.eps = eps
-        self.scale = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
         rms = x.pow(2).mean(dim=-1, keepdim=True)
         x_norm = x * torch.rsqrt(rms + self.eps)
-        return self.scale * x_norm
+        return self.weight * x_norm
+
+
+def build_rmsnorm(config: TransformerConfig) -> nn.Module:
+    impl = getattr(config, "rmsnorm_impl", "custom")
+    dim, eps = config.hidden_dim, config.rmsnorm_eps
+    if impl == "torch":
+        return TorchRMSNorm(dim, eps=eps)
+    elif impl == "custom":
+        return RMSNorm(dim, eps=eps)
+    else:
+        raise ValueError(f"unknown RMSNorm implementation: {impl}. Only 'torch', 'custom' are available.")
 
 
 class SwiGLU(nn.Module):
@@ -58,11 +70,11 @@ class Block(nn.Module):
         - Regularization with dropouts before residuals
         """
         super().__init__()
-        self.ln_1 = RMSNorm(config.hidden_dim)
+        self.ln_1 = build_rmsnorm(config)
         self.res_dropout_1 = nn.Dropout(config.dropout)
         self.attn = CausalSelfAttentionMLA(config) if config.use_mla else CausalSelfAttention(config)
 
-        self.ln_2 = RMSNorm(config.hidden_dim)
+        self.ln_2 = build_rmsnorm(config)
         self.res_dropout_2 = nn.Dropout(config.dropout)
         self.mlp = SwiGLU(config)
 
@@ -94,7 +106,7 @@ class TransformerForCausalLM(nn.Module, PyTorchModelHubMixin):
         self.token_emb = nn.Embedding(config.vocab_size, config.hidden_dim)
         self.emb_dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_final = RMSNorm(config.hidden_dim)
+        self.ln_final = build_rmsnorm(config)
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
@@ -114,8 +126,9 @@ class TransformerForCausalLM(nn.Module, PyTorchModelHubMixin):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, RMSNorm):
-            torch.nn.init.ones_(module.scale)
+        elif isinstance(module, (RMSNorm, TorchRMSNorm)):
+            if module.weight is not None:
+                torch.nn.init.ones_(module.weight)
 
     def resize_token_embeddings(self, new_vocab_size: int) -> None:
         """Grow (or shrink) the token embedding and lm_head to ``new_vocab_size``.
@@ -224,19 +237,12 @@ class CLIPVisionAdapter(nn.Module):
         self.vision_model = CLIPVisionModel.from_pretrained(config.vision_model_repo_id)
         for p in self.vision_model.parameters():
             p.requires_grad_(False)
-        self.vision_model.eval()
 
         self.adapter = nn.Linear(config.input_dim, config.output_dim)
 
-    def train(self, mode: bool = True):
-        # Keep the frozen CLIP tower in eval mode even when the parent module
-        # is switched to train() (so its dropout / LN stay deterministic).
-        super().train(mode)
-        self.vision_model.eval()
-        return self
-
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """pixel_values: [n_images, 3, H, W] -> [n_images, num_patches, output_dim]."""
+        self.vision_model.eval()
         with torch.no_grad():
             out = self.vision_model(pixel_values=pixel_values)
         # drop CLS patch embedding, keep per-patch features

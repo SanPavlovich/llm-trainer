@@ -37,6 +37,7 @@ model:
   rope_theta: 10000.0
   use_mla: false
   latent_dim: 128
+  attn_impl: sdpa          # ['eager', 'sdpa']; sdpa -> FlashAttention-2 kernel (RoPE only)
 
 vision_adapter:
   vision_model_repo_id: "openai/clip-vit-base-patch32"
@@ -62,18 +63,20 @@ trainer:
   val_after_train: true
 
 # PyTorch profiler. Traces are written to runs/pytorch_profiler/<run_name>/<exp_name>_<ts>/.
-# The schedule is wait -> warmup -> active. To trace the 10th iteration:
-# wait=9, warmup=0, active=1 (iterations are 0-indexed internally).
+# The schedule is wait -> warmup -> active (iterations are 0-indexed internally).
+# Here we skip the first 10 iterations (0..9) as warmup and record iterations
+# 10..20 (iter_num 9..19, i.e. the 10th through 20th steps): 11 active steps.
 profiler:
   enabled: true
-  wait: 8          # skip the first 9 iterations
-  warmup: 1        # no warmup
-  active: 1        # record 1 iteration (the 10th)
+  wait: 9          # skip the first 9 iterations (0..8) as warmup
+  warmup: 0        # no separate warmup phase
+  active: 10       
   repeat: 1        # only one wait/warmup/active cycle
   record_shapes: true
   profile_memory: true
   with_stack: false
-  # CUDA memory snapshot of a single iteration (viewable at https://pytorch.org/memory_viz)
-  memory_snapshot: true
-  memory_snapshot_step: 9        # iter_num (0-indexed) to snapshot => the 10th iteration
-  memory_snapshot_max_entries: 100000
+  # CUDA memory snapshot across the range of iterations (viewable at https://pytorch.org/memory_viz).
+  memory_snapshot: false
+  memory_snapshot_step: 9
+  memory_snapshot_stop_step: 18
+  memory_snapshot_max_entries: 1000000

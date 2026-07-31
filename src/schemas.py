@@ -23,6 +23,9 @@ class TransformerConfig(BaseModel):
     rope_theta: float = 10000.0
     use_mla: bool = False
     latent_dim: int = 128
+    rmsnorm_eps: float = 1e-6
+    attn_impl: str = "eager"
+    rmsnorm_impl: str = "custom"
 
 class VisionAdapterConfig(BaseModel):
     vision_model_repo_id: str
@@ -70,10 +73,11 @@ class ProfilerConfig(BaseModel):
     profile_memory: bool = True
     with_stack: bool = True
 
-    # CUDA memory snapshot: records the allocation history of a single iteration
-    # and dumps a pickle viewable at https://pytorch.org/memory_viz
+    # CUDA memory snapshot: records the allocation history and dumps a pickle
+    # viewable at https://pytorch.org/memory_viz
     memory_snapshot: bool = False
-    memory_snapshot_step: int = 9          # iteration (iter_num, 0-indexed) to snapshot
+    memory_snapshot_step: int = 9
+    memory_snapshot_stop_step: int | None = None
     memory_snapshot_max_entries: int = 100_000
 
 
