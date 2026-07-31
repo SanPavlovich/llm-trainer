@@ -17,3 +17,9 @@ python -m main
 **samples:**
 
 ![samples](./images/10k_steps_samples.png)
+
+**medium pretrain speed:**
+
+torch profiler and memory snapshot is enabled (takes less than 1 second)
+
+- 100/100 [00:42<00:00,  2.35it/s] - Windows, no optimizations

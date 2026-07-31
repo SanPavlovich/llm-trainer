@@ -1,0 +1,1 @@
+Folder with model checkpoins. Structure: model_checkpoint/exp_name/iteration.pkl
