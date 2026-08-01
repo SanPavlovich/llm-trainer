@@ -6,9 +6,9 @@
 # TransformerForCausalLM with this model block reports 304.3M parameters.
 
 run_name: llm_medium_pretrain        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
-exp_name: speedcheck_flashattn_refactor_train_stp100_bs16_ds300K_randinit         # name of this specific experiment within the run
+exp_name: speedcheck_sdpa_bf16_train_stp100_bs16_ds300K_randinit         # name of this specific experiment within the run
 seed: 42
-deterministic: true        # force deterministic CUDA/cuDNN algorithms for reproducible runs
+deterministic: false        # force deterministic CUDA/cuDNN algorithms for reproducible runs
 shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
 
 dataset_type: token_ids # ['text', 'token_ids', 'vision']
@@ -38,8 +38,8 @@ model:
   rope_theta: 10000.0
   use_mla: false
   latent_dim: 128
-  attn_impl: eager          # ['eager', 'sdpa']; sdpa -> FlashAttention-2 kernel (RoPE only)
-  rmsnorm_impl: torch      # ['custom', 'torch']; torch -> fused torch.nn.RMSNorm
+  attn_impl: sdpa          # ['eager', 'sdpa']; sdpa -> FlashAttention-2 kernel (RoPE only)
+  rmsnorm_impl: custom      # ['custom', 'torch']; torch -> fused torch.nn.RMSNorm
 
 trainer:
   save_checkpoint: false
@@ -55,6 +55,8 @@ trainer:
   val_after_train: false
   num_workers: 8
   prefetch_factor: 4
+  mixed_precision: true     # autocast forward/loss; bf16 -> ~2x faster, less memory
+  amp_dtype: bfloat16       # ['bfloat16', 'float16']; float16 also enables GradScaler
 
 # PyTorch profiler. Traces are written to runs/pytorch_profiler/<run_name>/<exp_name>_<ts>/.
 # The schedule is wait -> warmup -> active. To trace the 10th iteration:

@@ -77,6 +77,18 @@ class Trainer:
         logger.info(f"running on device {self.device}")
 
         self._setup_amp()
+        self._setup_compile()
+
+    def _setup_compile(self) -> None:
+        want_compile = bool(getattr(self.train_config, "compile", False))
+        if want_compile and self.device == "cuda":
+            mode = getattr(self.train_config, "compile_mode", "default")
+            logger.info(f"torch.compile enabled (mode={mode}); first steps include compilation")
+            self.train_model = torch.compile(self.model, mode=mode)
+        else:
+            if want_compile:
+                logger.warning("compile requested but device is not CUDA; running eager")
+            self.train_model = self.model
 
     def _setup_amp(self) -> None:
         """Configure mixed-precision (autocast) state from the trainer config.
@@ -176,7 +188,7 @@ class Trainer:
         for batch in tqdm(val_loader, desc="Validating", leave=False):
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             with self._autocast():
-                logits = self.model(**batch)
+                logits = self.train_model(**batch)
                 loss_mask = None if "image_ids_mask" not in batch else ~batch["image_ids_mask"].bool()
                 loss = cross_entropy_loss(
                     batch["input_ids"],
@@ -188,7 +200,23 @@ class Trainer:
             val_loss += loss.float()
 
         return val_loss / len(val_loader)
-    
+
+    @torch.no_grad()
+    def _log_grad_norm_per_layer(self) -> None:
+        sq_by_group: dict[str, float] = {}
+        for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            parts = name.split(".")
+            if parts[0] == "layers" and len(parts) > 1:
+                group = f"layer_{int(parts[1]):02d}"
+            else:
+                group = ".".join(parts[:2]) if len(parts) > 1 else parts[0]
+            sq_by_group[group] = sq_by_group.get(group, 0.0) + p.grad.detach().float().pow(2).sum().item()
+
+        for group, sq in sq_by_group.items():
+            self.writer.add_scalar(f"grad_norm_per_layer/{group}", sq ** 0.5, self.global_step)
+
     def save_checkpoint(self) -> None:
         checkpoint_name = f"{self.checkpoint_dir}/{self.global_step}.pkl"
         torch.save({
@@ -309,7 +337,7 @@ class Trainer:
                     # sensitive ops (softmax, cross-entropy, RMSNorm, RoPE) stay fp32.
                     with self._autocast():
                         with torch.profiler.record_function("model_forward"):
-                            logits = self.model(**batch)  # [bs; seq len; vocab size]
+                            logits = self.train_model(**batch)  # [bs; seq len; vocab size]
                         with torch.profiler.record_function("cross_entropy_loss"):
                             # For the VLM, skip [IMG] placeholder targets in the loss:
                             # they aren't real language, so predicting them is meaningless.
@@ -325,6 +353,9 @@ class Trainer:
                     with torch.profiler.record_function("clip_grad_norm"):
                         # Unscale before clipping so the norm/threshold are in true units.
                         self.scaler.unscale_(self.optimizer)
+                        every = self.train_config.log_grad_norm_per_layer_every
+                        if every and self.global_step % every == 0:
+                            self._log_grad_norm_per_layer()
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.clip_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()

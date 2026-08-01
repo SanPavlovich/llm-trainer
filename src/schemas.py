@@ -27,6 +27,7 @@ class TransformerConfig(BaseModel):
     attn_impl: str = "eager"
     rmsnorm_impl: str = "custom"
 
+
 class VisionAdapterConfig(BaseModel):
     vision_model_repo_id: str
     input_dim: int
@@ -55,7 +56,10 @@ class TrainerConfig(BaseModel):
     num_workers: int = 4
     prefetch_factor: int = 4
     mixed_precision: bool = False
-    amp_dtype: str = "bfloat16"   # ['bfloat16', 'float16']; float16 also enables GradScaler
+    amp_dtype: str = "bfloat16"             # ['bfloat16', 'float16']; float16 also enables GradScaler
+    log_grad_norm_per_layer_every: int = 0
+    compile: bool = False                   # torch.compile: JIT-compile the model for faster train/val steps (needs CUDA + triton)
+    compile_mode: str = "max-autotune"
 
 
 class ProfilerConfig(BaseModel):
