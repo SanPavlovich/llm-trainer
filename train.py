@@ -9,6 +9,7 @@ from tqdm.notebook import tqdm
 import numpy as np
 import multiprocessing as mp
 import torch
+import torch.distributed as dist
 from datasets import load_dataset, load_from_disk
 
 from src.dataset import (
@@ -27,7 +28,7 @@ from src.tokenizer.mp_worker import _init_fast, tokenize_batch_fast
 from src.model import TransformerForCausalLM, TransformerForVisualCausalLM
 from src.trainer import Trainer
 from src.schemas import TokenizerConfig, TransformerConfig, TrainerConfig, RunConfig
-from src.utils import timeit, set_seed
+from src.utils import timeit, set_seed, setup_distributed, cleanup_distributed, is_distributed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,23 +134,53 @@ if __name__ == "__main__":
     args = parse_args()
     config = RunConfig.from_yaml(args.config)
 
+    ddp_enabled = is_distributed()
+    if ddp_enabled:
+        rank, local_rank, world_size = setup_distributed()
+        if config.ddp.enabled and world_size != config.ddp.dp_size:
+            raise ValueError(
+                f"torchrun launched world_size={world_size}, but config.ddp.dp_size="
+                f"{config.ddp.dp_size}. Launch with --nproc_per_node={config.ddp.dp_size} "
+                f"(e.g. ./run_train.sh {args.config}) or update dp_size to match."
+            )
+    else:
+        if config.ddp.enabled:
+            logger.warning(
+                f"config.ddp.enabled=true (dp_size={config.ddp.dp_size}) but the process "
+                "was launched without torchrun; training on a single device. Use "
+                "run_train.sh or `torchrun --nproc_per_node=<dp_size> train.py ...`."
+            )
+        rank, local_rank, world_size = 0, 0, 1
+    is_main_process = rank == 0
+
+    # Same seed on every rank: model init must match before DDP broadcasts
+    # rank 0's weights: https://pytorch.org/docs/stable/notes/ddp.html
     set_seed(config.seed, deterministic=config.deterministic)
 
     tokenizer_config = config.tokenizer
     model_config = config.model
     train_config = config.trainer
 
-    time_str_format = datetime.datetime.now().strftime('%m-%d-%Y--%H-%M-%S')
+    # All ranks must agree on the same timestamped run dir; broadcast rank 0's
+    # value rather than trusting independently-generated clocks to match.
+    if ddp_enabled:
+        ts_holder = [datetime.datetime.now().strftime('%m-%d-%Y--%H-%M-%S')] if is_main_process else [None]
+        dist.broadcast_object_list(ts_holder, src=0)
+        time_str_format = ts_holder[0]
+    else:
+        time_str_format = datetime.datetime.now().strftime('%m-%d-%Y--%H-%M-%S')
+
     root_dir = Path(__file__).resolve().parent
     exp_subdir = root_dir/ "runs" / config.run_name / f"{config.exp_name}_{time_str_format}"
     checkpoint_dir = root_dir / "model_checkpoint" / config.run_name / f"{config.exp_name}_{time_str_format}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     tensorboard_dir = exp_subdir / "tensorboard"
     profiler_dir = exp_subdir / "pytorch_profiler"
-    tensorboard_dir.mkdir(parents=True, exist_ok=True)
 
-    save_config(exp_subdir, config)
+    if is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        save_config(exp_subdir, config)
 
     if config.tokenizer.cache_dir is None:
         raise ValueError("tokenizer cache_dir must not be None!")
@@ -174,25 +205,32 @@ if __name__ == "__main__":
         tokenized_dataset_dir = root_dir / "datasets" / config.tokenized_dataset_path
     
         if not os.path.exists(tokenized_dataset_dir):
-            logger.info(f"start training tokenizer on dataset: {dataset_dir}")
-            dataset = load_from_disk(str(dataset_dir))
-            vocab_fast, merges_fast = tokenizer_fast_train(
-                data=dataset["text"], 
-                vocab_size=tokenizer_config.vocab_size,
-                special_tokens=tokenizer_config.special_tokens,
-            )
+            # Only rank 0 trains the tokenizer and writes the tokenized corpus;
+            # other ranks wait at the barrier below and then load the result.
+            if is_main_process:
+                logger.info(f"start training tokenizer on dataset: {dataset_dir}")
+                dataset = load_from_disk(str(dataset_dir))
+                vocab_fast, merges_fast = tokenizer_fast_train(
+                    data=dataset["text"],
+                    vocab_size=tokenizer_config.vocab_size,
+                    special_tokens=tokenizer_config.special_tokens,
+                )
 
-            save_tokenizer_files(path=tokenizer_cache_dir_full, vocab=vocab_fast, merges=merges_fast)
-            tokenizer = ByteLevelBPETokenizer.from_pretrained(tokenizer_cache_dir_full)
+                save_tokenizer_files(path=tokenizer_cache_dir_full, vocab=vocab_fast, merges=merges_fast)
+                tokenizer = ByteLevelBPETokenizer.from_pretrained(tokenizer_cache_dir_full)
 
-            logger.info(f"start dataset tokenization: {dataset_dir}")
-            tokenize_dataset(
-                texts=dataset["text"], 
-                max_seq_len=train_config.max_seq_len, 
-                out_path=root_dir / "datasets" / config.tokenized_dataset_path,
-                tokenizer=tokenizer
-            )
-            logger.info(f"tokenized dataset saved at {root_dir / "datasets" / config.tokenized_dataset_path}")
+                logger.info(f"start dataset tokenization: {dataset_dir}")
+                tokenize_dataset(
+                    texts=dataset["text"],
+                    max_seq_len=train_config.max_seq_len,
+                    out_path=root_dir / "datasets" / config.tokenized_dataset_path,
+                    tokenizer=tokenizer
+                )
+                logger.info(f"tokenized dataset saved at {root_dir / "datasets" / config.tokenized_dataset_path}")
+            if ddp_enabled:
+                dist.barrier()
+            if not is_main_process:
+                tokenizer = ByteLevelBPETokenizer.from_pretrained(tokenizer_cache_dir_full)
         else:
             logger.info(f"pretrained tokenizer loaded from {pretrained_tokenizer_cache_dir}")
             tokenizer = ByteLevelBPETokenizer.from_pretrained(pretrained_tokenizer_cache_dir)
@@ -208,13 +246,27 @@ if __name__ == "__main__":
         train_dataset = torch.utils.data.Subset(full_dataset, range(n_train))
         test_dataset = torch.utils.data.Subset(full_dataset, range(n_train, len(full_dataset)))
 
+        train_sampler = None
+        if ddp_enabled:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank,
+                shuffle=config.shuffle_train, seed=config.seed, drop_last=True,
+            )
         train_dataloader = create_token_ids_dataloader(
             train_dataset, batch_size=train_config.batch_size,
-            drop_last=True, shuffle=config.shuffle_train,
+            drop_last=True, shuffle=config.shuffle_train, sampler=train_sampler,
         )
+        # Each rank validates its own shard of the val set; Trainer.validate()
+        # all-reduces the per-rank loss to a single averaged value.
+        val_sampler = None
+        if ddp_enabled:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_dataset, num_replicas=world_size, rank=rank,
+                shuffle=False, drop_last=False,
+            )
         test_dataloader = create_token_ids_dataloader(
             test_dataset, batch_size=train_config.batch_size,
-            drop_last=False, shuffle=False,
+            drop_last=False, shuffle=False, sampler=val_sampler,
         )
     elif config.dataset_type == "vision":
         # Image + text SFT. Load a pretrained tokenizer, add image special
@@ -268,13 +320,28 @@ if __name__ == "__main__":
                 persistent_workers=True,
                 prefetch_factor=train_config.prefetch_factor,
             )
+        train_sampler = None
+        if ddp_enabled:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank,
+                shuffle=config.shuffle_train, seed=config.seed, drop_last=True,
+            )
         train_dataloader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=train_config.batch_size, shuffle=config.shuffle_train,
-            drop_last=True, **loader_kwargs,
+            train_dataset, batch_size=train_config.batch_size,
+            shuffle=config.shuffle_train if train_sampler is None else None,
+            sampler=train_sampler, drop_last=True, **loader_kwargs,
         )
+        # Each rank validates its own shard; Trainer.validate() all-reduces
+        # the per-rank loss to a single averaged value.
+        val_sampler = None
+        if ddp_enabled:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_dataset, num_replicas=world_size, rank=rank,
+                shuffle=False, drop_last=False,
+            )
         test_dataloader = torch.utils.data.DataLoader(
             test_dataset, batch_size=train_config.batch_size, shuffle=False,
-            drop_last=False, **loader_kwargs,
+            sampler=val_sampler, drop_last=False, **loader_kwargs,
         )
         valid_images = get_valid_images(split)
     else:
@@ -332,10 +399,13 @@ if __name__ == "__main__":
             model.load_state_dict(pretrain_checkpoint["model"])
             logger.info(f"pretrained checkpoint loaded from {pretrained_model_dir}")
 
-    logger.info(f"Number of parameters: {model.n_params / 1e6:.2f}M")
-    logger.info(f"Number of trainable parameters: {model.n_trainable_params / 1e6:.2f}M")
-    logger.info(f"train_loader iterations count: {len(train_dataloader):_}")
-    logger.info(f"val_loader   iterations count: {len(test_dataloader):_}")
+    if is_main_process:
+        logger.info(f"Number of parameters: {model.n_params / 1e6:.2f}M")
+        logger.info(f"Number of trainable parameters: {model.n_trainable_params / 1e6:.2f}M")
+        logger.info(f"train_loader iterations count: {len(train_dataloader):_}")
+        logger.info(f"val_loader   iterations count: {len(test_dataloader):_}")
+        if ddp_enabled:
+            logger.info(f"DDP enabled: world_size={world_size}")
 
     trainer = Trainer(
         tokenizer=tokenizer,
@@ -347,10 +417,16 @@ if __name__ == "__main__":
         profiler_dir=profiler_dir,
         profiler_config=config.profiler,
         valid_images=valid_images,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
     )
-    logger.info(f"Start training...")
+    logger.info(f"rank {rank}: Start training...")
     trainer.train(
-        train_loader=train_dataloader, 
+        train_loader=train_dataloader,
         val_loader=test_dataloader
     )
-    logger.info(f"Training finised")
+    logger.info(f"rank {rank}: Training finised")
+
+    if ddp_enabled:
+        cleanup_distributed()

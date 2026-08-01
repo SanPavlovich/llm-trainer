@@ -41,6 +41,11 @@ class VisionAdapterConfig(BaseModel):
     image_end_token: str = "[IMG_END]"
 
 
+class DDPConfig(BaseModel):
+    enabled: bool = False
+    dp_size: int = 1
+
+
 class TrainerConfig(BaseModel):
     save_checkpoint: bool = False
     pretrained_model_path: str | None = None
@@ -113,6 +118,7 @@ class RunConfig(BaseModel):
     vision_adapter: VisionAdapterConfig | None = None
     trainer: TrainerConfig = TrainerConfig()
     profiler: ProfilerConfig = ProfilerConfig()
+    ddp: DDPConfig = DDPConfig()
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "RunConfig":

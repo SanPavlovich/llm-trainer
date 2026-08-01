@@ -216,10 +216,15 @@ def create_dataloader(
     batch_size: int,
     drop_last: bool,
     shuffle: bool | None = None,
+    sampler: torch.utils.data.Sampler | None = None,
 ) -> DataLoader:
     collate_fn = partial(collator, pad_token_id=pad_token_id, max_seq_len=max_seq_len)
+    # A sampler and shuffle=True are mutually exclusive in DataLoader; when a
+    # (Distributed)Sampler is given it already owns the shuffling.
+    shuffle = shuffle if sampler is None else None
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, collate_fn=collate_fn, pin_memory=True
+        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+        collate_fn=collate_fn, pin_memory=True, sampler=sampler,
     )
 
 
@@ -228,6 +233,7 @@ def create_token_ids_dataloader(
     batch_size: int,
     drop_last: bool,
     shuffle: bool | None = None,
+    sampler: torch.utils.data.Sampler | None = None,
 ) -> DataLoader:
     """DataLoader for :class:`TokenIdsDataset`.
 
@@ -236,6 +242,8 @@ def create_token_ids_dataloader(
     into batched tensors of shape ``[batch_size, seq_len]`` — the same contract
     the training loop expects from :func:`create_dataloader`.
     """
+    shuffle = shuffle if sampler is None else None
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, collate_fn=flatten_collator, pin_memory=True
+        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+        collate_fn=flatten_collator, pin_memory=True, sampler=sampler,
     )

@@ -5,6 +5,7 @@ from functools import wraps
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -42,6 +43,26 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         # cuBLAS reproducibility for matmul on CUDA >= 10.2
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def is_distributed() -> bool:
+    """True when running under torchrun (i.e. RANK/WORLD_SIZE are set)."""
+    return "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+
+
+def setup_distributed() -> tuple[int, int, int]:
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return rank, local_rank, world_size
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps) -> torch.optim.lr_scheduler.LRScheduler:

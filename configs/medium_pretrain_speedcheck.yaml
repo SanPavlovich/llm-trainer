@@ -18,6 +18,7 @@ test_size: 0.01
 valid_texts:
   - "Заходит в бар"
   - "Штирлиц пришел домой"
+  - "я не думал, что так быстро"
 
 tokenizer:
   cache_dir: "NotEvilAI_ruwiki_300K_tokenized_msl192"
@@ -52,7 +53,7 @@ trainer:
   clip_grad_norm: 1.0
   n_steps: 100
   val_every_n_steps: 0
-  val_after_train: false
+  val_after_train: true
   num_workers: 8
   prefetch_factor: 4
   mixed_precision: true     # autocast forward/loss; bf16 -> ~2x faster, less memory

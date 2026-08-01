@@ -5,9 +5,12 @@ import logging
 from tqdm.auto import tqdm
 from typing import Any
 import torch
+import torch.distributed as dist
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile as Profiler
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import CLIPImageProcessor
 
@@ -38,57 +41,85 @@ class Trainer:
         scheduler: torch.optim.lr_scheduler.LRScheduler|None=None,
         valid_texts: list[str] | None = None,
         valid_images: dict | None = None,
+        rank: int = 0,
+        local_rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.train_config = train_config
         self.checkpoint_dir = checkpoint_dir
         self.profiler_dir = profiler_dir
         self.profiler_config = profiler_config
         self.tokenizer = tokenizer
-        self.model = model
         self.valid_texts = valid_texts
         self.valid_images = valid_images
-            
+
+        self.rank = rank
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.is_distributed = world_size > 1
+        self.is_main_process = rank == 0
+
         if optimizer is None:
             self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                model.parameters(), 
-                lr=self.train_config.learning_rate, 
+                model.parameters(),
+                lr=self.train_config.learning_rate,
                 weight_decay=self.train_config.weight_decay
             )
         else:
             self.optimizer = optimizer
         if scheduler is None:
             self.scheduler = get_linear_schedule_with_warmup(
-                self.optimizer, 
-                num_warmup_steps=0.1 * self.train_config.n_steps, 
+                self.optimizer,
+                num_warmup_steps=0.1 * self.train_config.n_steps,
                 num_training_steps=self.train_config.n_steps
             )
         else:
             self.scheduler = scheduler
         self.global_step = 0
-        self.writer = SummaryWriter(tensorboard_dir / "train")
-        self.valid_writer = SummaryWriter(tensorboard_dir / "valid")
 
-        if torch.cuda.is_available():
+        # Only rank 0 writes logs/checkpoints; other ranks get no-op writers.
+        if self.is_main_process:
+            self.writer = SummaryWriter(tensorboard_dir / "train")
+            self.valid_writer = SummaryWriter(tensorboard_dir / "valid")
+        else:
+            self.writer = None
+            self.valid_writer = None
+
+        if self.is_distributed:
+            self.device = f"cuda:{self.local_rank}"
+        elif torch.cuda.is_available():
             self.device = "cuda"
         elif torch.backends.mps.is_available():
             self.device = "mps"
         else:
             self.device = "cpu"
-        logger.info(f"running on device {self.device}")
+        logger.info(f"rank {self.rank}: running on device {self.device}")
 
+        # self.model stays the raw (unwrapped) module: generate()/state_dict()/
+        # n_params need it, and DDP/compile wrappers don't expose those directly.
+        self.model = model
+        self.model.to(self.device)
+
+        self._setup_ddp()
         self._setup_amp()
         self._setup_compile()
 
+    def _setup_ddp(self) -> None:
+        if self.is_distributed:
+            self.ddp_model = DDP(self.model, device_ids=[self.local_rank])
+        else:
+            self.ddp_model = self.model
+
     def _setup_compile(self) -> None:
         want_compile = bool(getattr(self.train_config, "compile", False))
-        if want_compile and self.device == "cuda":
+        if want_compile and self.device.startswith("cuda"):
             mode = getattr(self.train_config, "compile_mode", "default")
             logger.info(f"torch.compile enabled (mode={mode}); first steps include compilation")
-            self.train_model = torch.compile(self.model, mode=mode)
+            self.train_model = torch.compile(self.ddp_model, mode=mode)
         else:
             if want_compile:
                 logger.warning("compile requested but device is not CUDA; running eager")
-            self.train_model = self.model
+            self.train_model = self.ddp_model
 
     def _setup_amp(self) -> None:
         """Configure mixed-precision (autocast) state from the trainer config.
@@ -181,11 +212,25 @@ class Trainer:
             torch.cuda.memory._record_memory_history(enabled=None)  # stop & free buffer
             logger.info(f"CUDA memory snapshot saved to {snapshot_path}")
 
+    def _all_reduce_mean(self, value: Tensor) -> Tensor:
+        """Average a scalar tensor across ranks; a no-op outside DDP."""
+        if not self.is_distributed:
+            return value
+        value = value.clone()
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        return value / self.world_size
+
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Tensor:
+        """Validate over this rank's shard, then average the loss across ranks.
+
+        val_loader is expected to hand each rank a disjoint slice of the val
+        set (via DistributedSampler under DDP), so every rank contributes an
+        equal-sized share of work and the all-reduce yields the true mean.
+        """
         self.model.eval()
         val_loss = 0.0
-        for batch in tqdm(val_loader, desc="Validating", leave=False):
+        for batch in tqdm(val_loader, desc="Validating", leave=False, disable=not self.is_main_process):
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             with self._autocast():
                 logits = self.train_model(**batch)
@@ -199,10 +244,13 @@ class Trainer:
             # accumulate in fp32 to avoid drift over many val batches
             val_loss += loss.float()
 
-        return val_loss / len(val_loader)
+        val_loss = val_loss / len(val_loader)
+        return self._all_reduce_mean(val_loss)
 
     @torch.no_grad()
     def _log_grad_norm_per_layer(self) -> None:
+        if not self.is_main_process:
+            return
         sq_by_group: dict[str, float] = {}
         for name, p in self.model.named_parameters():
             if p.grad is None:
@@ -218,6 +266,8 @@ class Trainer:
             self.writer.add_scalar(f"grad_norm_per_layer/{group}", sq ** 0.5, self.global_step)
 
     def save_checkpoint(self) -> None:
+        if not self.is_main_process:
+            return
         checkpoint_name = f"{self.checkpoint_dir}/{self.global_step}.pkl"
         torch.save({
             "model": self.model.state_dict(),
@@ -234,6 +284,8 @@ class Trainer:
         pass
     
     def log_model_samples(self, text_field: str) -> None:
+        if not self.is_main_process:
+            return
         if self.valid_images is not None:
             self._log_visual_samples(text_field)
         else:
@@ -256,8 +308,8 @@ class Trainer:
 
         for i, (start_text, res_text) in enumerate(zip(self.valid_texts, result_texts)):
             self.writer.add_text(
-                text_field,
-                f"**sample {i+1}:**\n\n[{res_text[:len(start_text)]}]{res_text[len(start_text):]}",
+                f"{text_field}/sample_{i+1}",
+                f"[{res_text[:len(start_text)]}]{res_text[len(start_text):]}",
                 self.global_step
             )
 
@@ -310,22 +362,28 @@ class Trainer:
                 )
 
     def train(
-        self, 
-        train_loader: DataLoader, 
+        self,
+        train_loader: DataLoader,
         val_loader: DataLoader | None,
     ) -> None:
-        self.model.to(self.device)
         self.model.train()
 
         profiler = self._build_profiler()
+        sampler = train_loader.sampler
+        epoch = 0
+        if isinstance(sampler, DistributedSampler):
+            sampler.set_epoch(epoch)
         data_iter = iter(train_loader)
         self.train_loss, self.valid_loss = None, None
 
         with profiler if profiler is not None else contextlib.nullcontext():
-            for iter_num in tqdm(range(self.train_config.n_steps), desc="train steps"):
+            for iter_num in tqdm(range(self.train_config.n_steps), desc="train steps", disable=not self.is_main_process):
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    epoch += 1
+                    if isinstance(sampler, DistributedSampler):
+                        sampler.set_epoch(epoch)
                     data_iter = iter(train_loader)
                     batch = next(data_iter)
 
@@ -362,10 +420,14 @@ class Trainer:
                     self.optimizer.zero_grad()
                     self.scheduler.step()
 
-                self.train_loss = loss.item()
-                self.writer.add_scalar("loss", self.train_loss, self.global_step)
-                self.writer.add_scalar("grad_norm", grad_norm, self.global_step)
-                self.writer.add_scalar("learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
+                # Each rank's `loss` is computed on its own micro-batch (the
+                # global batch's shard); average across ranks before logging
+                # so the reported loss reflects the full batch, not one shard.
+                self.train_loss = self._all_reduce_mean(loss.detach()).item()
+                if self.is_main_process:
+                    self.writer.add_scalar("loss", self.train_loss, self.global_step)
+                    self.writer.add_scalar("grad_norm", grad_norm, self.global_step)
+                    self.writer.add_scalar("learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
 
                 if (
                     val_loader is not None
@@ -375,7 +437,8 @@ class Trainer:
                 ):
                     val_loss = self.validate(val_loader)
                     self.valid_loss = val_loss.item()
-                    self.valid_writer.add_scalar("loss", val_loss, self.global_step)
+                    if self.is_main_process:
+                        self.valid_writer.add_scalar("loss", val_loss, self.global_step)
                     self.log_model_samples(text_field=f"model samples step {self.global_step}")
                     self.model.train()
 
@@ -393,8 +456,9 @@ class Trainer:
         if self.train_config.val_after_train and val_loader is not None:
             val_loss = self.validate(val_loader)
             self.valid_loss = val_loss
-            self.valid_writer.add_scalar("loss", val_loss, self.global_step)
+            if self.is_main_process:
+                self.valid_writer.add_scalar("loss", val_loss, self.global_step)
             self.log_model_samples(text_field="model samples train end")
-        
+
         if self.train_config.save_checkpoint:
             self.save_checkpoint()

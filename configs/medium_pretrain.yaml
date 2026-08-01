@@ -6,7 +6,7 @@
 # TransformerForCausalLM with this model block reports 304.3M parameters.
 
 run_name: llm_medium_pretrain        # groups experiments; log dir is runs/<run_name>/<exp_name>_<timestamp>
-exp_name: flash_bf16_compile_stp250k_bs16_ds300K_randinit_ubuntu_torch211         # name of this specific experiment within the run
+exp_name: flash_bf16_compile_dp_size2_stp250k_bs16_ds300K_randinit_ubuntu_torch211         # name of this specific experiment within the run
 seed: 42
 deterministic: false        # force deterministic CUDA/cuDNN algorithms for reproducible runs
 shuffle_train: false       # set false to strictly track loss convergence when adding a new feature
@@ -15,9 +15,18 @@ dataset_type: token_ids # ['text', 'token_ids', 'vision']
 tokenized_dataset_path: "NotEvilAI_ruwiki_300K_tokenized_msl192.npy"
 test_size: 0.01
 
+# Distributed Data Parallel. Only takes effect when launched via run_train.sh
+# (or torchrun directly) -- running plain `python train.py` ignores it and
+# trains on a single device. dp_size sets how many processes/GPUs to launch;
+# train.py cross-checks it against torchrun's actual world size.
+ddp:
+  enabled: false
+  dp_size: 1
+
 valid_texts:
   - "Заходит в бар"
   - "Штирлиц пришел домой"
+  - "Меня уволили с работы, я даже не думал, что"
 
 tokenizer:
   cache_dir: "NotEvilAI_ruwiki_300K_tokenized_msl192"
